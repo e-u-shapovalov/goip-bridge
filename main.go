@@ -1,13 +1,13 @@
 // goip-bridge — standalone GoIP SMS/USSD gateway.
 //
-// One file, Go stdlib only. Speaks the GoIP "SMS server" UDP protocol directly
-// with the hardware (the GoIP box keepalives in, we reply and drive sends/USSD),
-// and exposes a small HTTP API + an optional outbound webhook. Replaces the
-// goipcron + MySQL + Apache + PHP stack.
+// One file, Go + a MySQL driver. Speaks the GoIP "SMS server" UDP protocol
+// directly with the hardware and integrates with MySQL: inbound SMS are written
+// to an inbox table, outbound SMS are read from an outbox queue and their status
+// (sent / failed / delivered) is written back. A small HTTP API (USSD, direct
+// send, lines, inbox) and an optional webhook are also provided.
 //
-// Protocol was reverse-engineered from the original goipcron binary and a live
-// packet capture. Device does GSM7/UCS-2 encoding and multipart split/reassembly,
-// so we send/receive whole message text.
+// The protocol was reverse-engineered from the original goipcron binary, the
+// official SMS-server spec, and live packet captures.
 //
 // Build:  go build -o goip-bridge .
 // Run:    ./goip-bridge -config config.json
@@ -15,6 +15,7 @@ package main
 
 import (
 	"bytes"
+	"database/sql"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -27,22 +28,36 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	_ "github.com/go-sql-driver/mysql"
 )
 
 // ----------------------------------------------------------------------------
 // Config
 // ----------------------------------------------------------------------------
 
+type DBConfig struct {
+	Host        string `json:"host"`
+	Port        int    `json:"port"`
+	User        string `json:"user"`
+	Password    string `json:"password"`
+	Name        string `json:"name"`
+	InboxTable  string `json:"inbox_table"`
+	OutboxTable string `json:"outbox_table"`
+	PollSec     int    `json:"poll_sec"`
+}
+
 type Config struct {
-	ListenUDP     string            `json:"listen_udp"`      // device-facing, e.g. ":44444"
-	ListenHTTP    string            `json:"listen_http"`     // API, e.g. "127.0.0.1:8080"
-	HTTPToken     string            `json:"http_token"`      // Bearer token for the API ("" = open)
-	WebhookURL    string            `json:"webhook_url"`     // POST inbound SMS + DLR here ("" = off)
-	WebhookToken  string            `json:"webhook_token"`   // sent as Bearer to the webhook
-	SendTimeout   int               `json:"send_timeout_sec"`
-	USSDTimeout   int               `json:"ussd_timeout_sec"`
-	RetransmitSec int               `json:"retransmit_sec"`
-	LinePasswords map[string]string `json:"line_passwords"` // optional override; else learned from keepalive
+	ListenUDP      string            `json:"listen_udp"`      // device-facing, e.g. "172.16.172.3:44444"
+	ListenHTTP     string            `json:"listen_http"`     // API, e.g. "127.0.0.1:8080"
+	HTTPToken      string            `json:"http_token"`      // Bearer token for the API ("" = open)
+	WebhookURL     string            `json:"webhook_url"`     // optional POST of inbound SMS + DLR ("" = off)
+	WebhookToken   string            `json:"webhook_token"`   // sent as Bearer to the webhook
+	SendTimeout    int               `json:"send_timeout_sec"`
+	USSDTimeout    int               `json:"ussd_timeout_sec"`
+	USSDRetransmit int               `json:"ussd_retransmit_sec"`
+	DB             *DBConfig         `json:"db"`             // optional MySQL integration ("" / absent = off)
+	LinePasswords  map[string]string `json:"line_passwords"` // optional override; else learned from keepalive
 }
 
 func loadConfig(path string) (*Config, error) {
@@ -64,10 +79,27 @@ func loadConfig(path string) (*Config, error) {
 		c.SendTimeout = 45
 	}
 	if c.USSDTimeout == 0 {
-		c.USSDTimeout = 60
+		c.USSDTimeout = 120
 	}
-	if c.RetransmitSec == 0 {
-		c.RetransmitSec = 5
+	if c.USSDRetransmit == 0 {
+		c.USSDRetransmit = 60
+	}
+	if c.DB != nil {
+		if c.DB.Host == "" {
+			c.DB.Host = "127.0.0.1"
+		}
+		if c.DB.Port == 0 {
+			c.DB.Port = 3306
+		}
+		if c.DB.InboxTable == "" {
+			c.DB.InboxTable = "goip_inbox"
+		}
+		if c.DB.OutboxTable == "" {
+			c.DB.OutboxTable = "goip_outbox"
+		}
+		if c.DB.PollSec == 0 {
+			c.DB.PollSec = 2
+		}
 	}
 	if c.LinePasswords == nil {
 		c.LinePasswords = map[string]string{}
@@ -109,6 +141,7 @@ type Inbound struct {
 type Server struct {
 	cfg  *Config
 	conn *net.UDPConn
+	db   *sql.DB
 
 	mu    sync.RWMutex
 	lines map[string]*Line
@@ -155,8 +188,7 @@ func (s *Server) udpLoop() {
 			log.Printf("udp read error: %v", err)
 			continue
 		}
-		payload := string(buf[:n])
-		s.dispatch(payload, addr)
+		s.dispatch(string(buf[:n]), addr)
 	}
 }
 
@@ -173,13 +205,13 @@ func (s *Server) dispatch(payload string, addr *net.UDPAddr) {
 		case "DELIVER":
 			s.handleDeliver(p, seq, addr)
 		default:
-			// CELLINFO / BCCH / CGATT / remain_time / ... — just acknowledge.
+			// CELLINFO / BCCH / CGATT / ... — just acknowledge.
 			s.sendTo(addr, fmt.Sprintf("%s %s OK", verb, seq))
 		}
 	default:
 		// Space-delimited response for an in-flight send/USSD session:
-		// "PASSWORD <id>", "SEND <id>", "WAIT <id> <ref>", "ERROR <id> <ref> ...",
-		// "USSD <id> <text>", "USSDERROR <id> ...", "USSDEXIT <id>".
+		// "PASSWORD <id>", "SEND <id>", "WAIT <id> <ref>", "OK <id> <ref> <sms_no>",
+		// "ERROR <id> ...", "USSD <id> <text>", "USSDERROR ...", "USSDEXIT ...".
 		tok := strings.Fields(p)
 		if len(tok) >= 2 {
 			if ch, ok := s.sessions.Load(tok[1]); ok {
@@ -187,14 +219,11 @@ func (s *Server) dispatch(payload string, addr *net.UDPAddr) {
 				case ch.(chan string) <- p:
 				default:
 				}
-				return
 			}
 		}
-		// Unknown / stray packet — ignore quietly.
 	}
 }
 
-// isColonEvent reports whether p looks like "VERB:<seq>;...".
 func isColonEvent(p string) bool {
 	i := strings.IndexByte(p, ':')
 	if i <= 0 {
@@ -208,7 +237,7 @@ func isColonEvent(p string) bool {
 	return true
 }
 
-func splitColonEvent(p string) (verb, seq string, rest string) {
+func splitColonEvent(p string) (verb, seq, rest string) {
 	i := strings.IndexByte(p, ':')
 	verb = p[:i]
 	rest = p[i+1:]
@@ -222,7 +251,7 @@ func splitColonEvent(p string) (verb, seq string, rest string) {
 	return
 }
 
-// fields parses a ";"-separated key:value list, but treats everything after the
+// fields parses a ";"-separated key:value list, treating everything after the
 // first "msg:" as the raw message body (it may contain ; and :).
 func fields(s string) (map[string]string, string) {
 	m := map[string]string{}
@@ -248,7 +277,7 @@ func fields(s string) (map[string]string, string) {
 // ----------------------------------------------------------------------------
 
 func (s *Server) handleKeepalive(p string, addr *net.UDPAddr) {
-	// req:<n>;id:Go1;pass:Go1;num:..;signal:..;gsm_status:LOGIN;...;imei:..;imsi:..;iccid:..;pro:<carrier>;...
+	// req:<n>;id:Go1;pass:Go1;num:..;signal:..;gsm_status:LOGIN;...;imei:..;pro:<carrier>;...
 	_, seq, rest := splitColonEvent(p)
 	f, _ := fields(rest)
 	id := f["id"]
@@ -291,32 +320,66 @@ func (s *Server) handleKeepalive(p string, addr *net.UDPAddr) {
 // ----------------------------------------------------------------------------
 
 func (s *Server) handleReceive(p, seq string, addr *net.UDPAddr) {
-	// CONFIRMED live:
-	//   RECEIVE:<n>;id:<line>;password:<pwd>;srcnum:<from>;msg:<text>
-	//   e.g. RECEIVE:2;id:Go1;password:Go1;srcnum:+996557622222;msg:Test 111
-	// Multipart long SMS arrives already reassembled by the device in one packet.
+	// RECEIVE:<n>;id:<line>;password:<pwd>;srcnum:<from>;msg:<text>
+	// Long/multipart messages are reassembled by the device into one packet.
 	_, _, rest := splitColonEvent(p)
 	f, body := fields(rest)
 	from := first(f, "srcnum", "num", "src", "sender")
 	line := f["id"]
-	s.sendTo(addr, fmt.Sprintf("RECEIVE %s OK", seq)) // ack first so device stops retransmitting
+	s.sendTo(addr, fmt.Sprintf("RECEIVE %s OK", seq)) // ack first so the device stops retransmitting
 
 	in := Inbound{Line: line, From: from, Text: body, Time: time.Now()}
 	s.storeInbox(in)
 	log.Printf("RECV line=%s from=%s len=%d", line, from, len(body))
+
+	if s.db != nil {
+		go func() {
+			_, err := s.db.Exec("INSERT INTO "+s.cfg.DB.InboxTable+
+				" (line, from_number, text, received_at) VALUES (?,?,?,NOW())", line, from, body)
+			if err != nil {
+				log.Printf("inbox insert: %v", err)
+			}
+		}()
+	}
 	if s.cfg.WebhookURL != "" {
 		go s.webhook(map[string]any{"type": "sms", "line": line, "from": from, "text": body, "time": in.Time})
 	}
 }
 
 func (s *Server) handleDeliver(p, seq string, addr *net.UDPAddr) {
-	// DELIVER:<n>;id:<line>;password:<pwd>;sms_no:<k>;state:<s>
+	// DELIVER:<n>;id:<line>;password:<pwd>;sms_no:<k>;state:<s>   (state 0 = delivered)
 	_, _, rest := splitColonEvent(p)
 	f, _ := fields(rest)
 	s.sendTo(addr, fmt.Sprintf("DELIVER %s OK", seq))
-	log.Printf("DLR line=%s sms_no=%s state=%s", f["id"], f["sms_no"], f["state"])
+	line, smsNo, state := f["id"], f["sms_no"], f["state"]
+	log.Printf("DLR line=%s sms_no=%s state=%s", line, smsNo, state)
+
+	if s.db != nil && smsNo != "" {
+		go func() {
+			ot := s.cfg.DB.OutboxTable
+			// A DLR can arrive in the same instant the send's 'sent'+sms_no row is committed.
+			// Retry until the matching 'sent' row is there (or give up).
+			for i := 0; i < 6; i++ {
+				var res sql.Result
+				var err error
+				if state == "0" {
+					res, err = s.db.Exec("UPDATE "+ot+" SET status='delivered', delivered_at=NOW()"+
+						" WHERE line=? AND sms_no=? AND status='sent' ORDER BY id DESC LIMIT 1", line, smsNo)
+				} else {
+					res, err = s.db.Exec("UPDATE "+ot+" SET status='failed', error_code=?, delivered_at=NOW()"+
+						" WHERE line=? AND sms_no=? AND status='sent' ORDER BY id DESC LIMIT 1", "dlr_state:"+state, line, smsNo)
+				}
+				if err == nil {
+					if n, _ := res.RowsAffected(); n > 0 {
+						return
+					}
+				}
+				time.Sleep(1500 * time.Millisecond)
+			}
+		}()
+	}
 	if s.cfg.WebhookURL != "" {
-		go s.webhook(map[string]any{"type": "dlr", "line": f["id"], "sms_no": f["sms_no"], "state": f["state"], "time": time.Now()})
+		go s.webhook(map[string]any{"type": "dlr", "line": line, "sms_no": smsNo, "state": state, "time": time.Now()})
 	}
 }
 
@@ -330,12 +393,19 @@ func (s *Server) storeInbox(in Inbound) {
 }
 
 // ----------------------------------------------------------------------------
-// Outbound: SMS send  (MSG -> PASSWORD -> SEND handshake, confirmed live)
+// Outbound: SMS send
 // ----------------------------------------------------------------------------
 
-func (s *Server) sendSMS(line *Line, number, text string) (string, error) {
+// sendSMS drives one send and returns (ok, sms_no, detail).
+//   ok=true:  sent; sms_no is the device counter.
+//   ok=false: detail is the failure reason ("errorstatus:N", "PASSWORD", "timeout", ...).
+//
+// Protocol: MSG -> dev:PASSWORD -> PASSWORD pass -> dev:SEND -> SEND ref num ->
+//           dev:WAIT -> dev:OK <id> <ref> <sms_no> (sent) | ERROR <id> <ref> errorstatus:<n>.
+// Never re-send SEND while WAITing — the device performs a fresh send per SEND (duplicates).
+func (s *Server) sendSMS(line *Line, number, text string) (bool, string, string) {
 	if line.Addr == nil {
-		return "", fmt.Errorf("line %s has no known address (no keepalive yet)", line.ID)
+		return false, "", "no_address"
 	}
 	id := s.nextID()
 	ref := s.nextID()
@@ -344,59 +414,52 @@ func (s *Server) sendSMS(line *Line, number, text string) (string, error) {
 	defer s.sessions.Delete(id)
 
 	addr := line.Addr
-	pass := line.Password
 	send := func(m string) { s.sendTo(addr, m) }
 
 	send(fmt.Sprintf("MSG %s %d %s\n", id, len(text), text))
-	state := "MSG"
+	submitted := false
 	overall := time.After(time.Duration(s.cfg.SendTimeout) * time.Second)
-	retx := time.Duration(s.cfg.RetransmitSec) * time.Second
-
 	for {
 		select {
 		case <-overall:
 			send(fmt.Sprintf("DONE %s\n", id))
-			return "timeout", nil
-		case <-time.After(retx):
-			// UDP is lossy — re-drive the current step.
-			switch state {
-			case "MSG":
-				send(fmt.Sprintf("MSG %s %d %s\n", id, len(text), text))
-			case "SENT":
-				send(fmt.Sprintf("SEND %s %s %s\n", id, ref, number))
-			}
+			return false, "", "timeout"
 		case resp := <-ch:
 			tok := strings.Fields(resp)
+			if len(tok) == 0 {
+				continue
+			}
 			switch tok[0] {
 			case "PASSWORD":
-				send(fmt.Sprintf("PASSWORD %s %s\n", id, pass))
-				state = "PASSWORD"
+				send(fmt.Sprintf("PASSWORD %s %s\n", id, line.Password))
 			case "SEND":
-				if state == "SENT" {
-					// bare "SEND <id>" after we provided the recipient = accepted by network.
-					send(fmt.Sprintf("DONE %s\n", id))
-					return "sent", nil
+				if !submitted {
+					send(fmt.Sprintf("SEND %s %s %s\n", id, ref, number))
+					submitted = true
 				}
-				// device is ready for a recipient
-				send(fmt.Sprintf("SEND %s %s %s\n", id, ref, number))
-				state = "SENT"
 			case "WAIT":
-				// still processing; keep waiting
-			case "ERROR":
-				code := ""
-				if len(tok) >= 3 {
-					code = tok[len(tok)-1]
-				}
+				// queued / sending — wait for OK or ERROR
+			case "OK":
 				send(fmt.Sprintf("DONE %s\n", id))
-				return "failed " + code, nil
+				smsNo := ""
+				if len(tok) >= 4 {
+					smsNo = tok[3]
+				}
+				return true, smsNo, ""
+			case "ERROR":
+				send(fmt.Sprintf("DONE %s\n", id))
+				detail := "error"
+				if p := strings.SplitN(resp, " ", 3); len(p) >= 3 {
+					detail = p[2] // "<ref> errorstatus:<n>" or "PASSWORD"
+				}
+				return false, "", detail
 			}
 		}
 	}
 }
 
 // ----------------------------------------------------------------------------
-// Outbound: USSD  (CONFIRMED live: "USSD <id> <pass> <code>" -> "USSD <id> <reply>")
-// Note: USSD command is sent WITHOUT a trailing newline, else "\n" leaks into the code.
+// Outbound: USSD  ("USSD <id> <pass> <code>" -> "USSD <id> <reply>"); no trailing newline.
 // ----------------------------------------------------------------------------
 
 func (s *Server) sendUSSD(line *Line, code string) (string, error) {
@@ -410,25 +473,28 @@ func (s *Server) sendUSSD(line *Line, code string) (string, error) {
 
 	addr := line.Addr
 	send := func(m string) { s.sendTo(addr, m) }
-	send(fmt.Sprintf("USSD %s %s %s\n", id, line.Password, code))
+	cmd := fmt.Sprintf("USSD %s %s %s", id, line.Password, code) // no trailing newline (leaks into the code otherwise)
+	send(cmd)
 
 	overall := time.After(time.Duration(s.cfg.USSDTimeout) * time.Second)
-	retx := time.Duration(s.cfg.RetransmitSec) * time.Second
+	retx := time.Duration(s.cfg.USSDRetransmit) * time.Second
 	for {
 		select {
 		case <-overall:
 			send(fmt.Sprintf("DONE %s\n", id))
 			return "", fmt.Errorf("ussd timeout")
 		case <-time.After(retx):
-			send(fmt.Sprintf("USSD %s %s %s", id, line.Password, code))
+			send(cmd) // re-send only after a long interval (default 60s), or it breaks the USSD session
 		case resp := <-ch:
 			tok := strings.Fields(resp)
+			if len(tok) == 0 {
+				continue
+			}
 			switch tok[0] {
 			case "USSD":
-				// "USSD <id> <reply text...>"
 				reply := ""
-				if len(tok) >= 3 {
-					reply = strings.SplitN(resp, " ", 3)[2]
+				if p := strings.SplitN(resp, " ", 3); len(p) >= 3 {
+					reply = p[2]
 				}
 				send(fmt.Sprintf("DONE %s\n", id))
 				return reply, nil
@@ -440,6 +506,93 @@ func (s *Server) sendUSSD(line *Line, code string) (string, error) {
 				return "", nil
 			}
 		}
+	}
+}
+
+// ----------------------------------------------------------------------------
+// MySQL: outbox queue worker
+// ----------------------------------------------------------------------------
+
+func (s *Server) initDB() error {
+	c := s.cfg.DB
+	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?parseTime=true&charset=utf8mb4&loc=Local",
+		c.User, c.Password, c.Host, c.Port, c.Name)
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		return err
+	}
+	db.SetMaxOpenConns(8)
+	db.SetConnMaxLifetime(3 * time.Minute)
+	if err := db.Ping(); err != nil {
+		return err
+	}
+	s.db = db
+	return nil
+}
+
+func (s *Server) outboxLoop() {
+	sem := make(chan struct{}, 8) // max concurrent sends across lines
+	t := time.NewTicker(time.Duration(s.cfg.DB.PollSec) * time.Second)
+	defer t.Stop()
+	ot := s.cfg.DB.OutboxTable
+	for range t.C {
+		rows, err := s.db.Query("SELECT id, line, to_number, text FROM " + ot +
+			" WHERE status='queued' ORDER BY id LIMIT 100")
+		if err != nil {
+			log.Printf("outbox query: %v", err)
+			continue
+		}
+		type job struct {
+			id       int64
+			line     sql.NullString
+			to, text string
+		}
+		var jobs []job
+		for rows.Next() {
+			var j job
+			if err := rows.Scan(&j.id, &j.line, &j.to, &j.text); err == nil {
+				jobs = append(jobs, j)
+			}
+		}
+		rows.Close()
+		for _, j := range jobs {
+			// claim atomically so a job is sent exactly once
+			res, err := s.db.Exec("UPDATE "+ot+" SET status='sending' WHERE id=? AND status='queued'", j.id)
+			if err != nil {
+				log.Printf("outbox claim: %v", err)
+				continue
+			}
+			if n, _ := res.RowsAffected(); n == 0 {
+				continue
+			}
+			sem <- struct{}{}
+			go func(id int64, lineID, to, text string) {
+				defer func() { <-sem }()
+				s.processSend(id, lineID, to, text)
+			}(j.id, j.line.String, j.to, j.text)
+		}
+	}
+}
+
+func (s *Server) processSend(id int64, lineID, to, text string) {
+	ot := s.cfg.DB.OutboxTable
+	ln := s.pickLine(lineID)
+	if ln == nil {
+		// no alive line right now — put it back to retry on the next poll
+		s.db.Exec("UPDATE "+ot+" SET status='queued' WHERE id=?", id)
+		return
+	}
+	ok, smsNo, detail := s.sendSMS(ln, to, text)
+	if ok {
+		var smsNoVal interface{}
+		if n, err := strconv.Atoi(smsNo); err == nil {
+			smsNoVal = n
+		}
+		s.db.Exec("UPDATE "+ot+" SET status='sent', sms_no=?, line=?, error_code=NULL, sent_at=NOW() WHERE id=?",
+			smsNoVal, ln.ID, id)
+	} else {
+		s.db.Exec("UPDATE "+ot+" SET status='failed', error_code=?, line=?, sent_at=NOW() WHERE id=?",
+			detail, ln.ID, id)
 	}
 }
 
@@ -461,11 +614,9 @@ func (s *Server) httpLoop() {
 
 func (s *Server) auth(h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if s.cfg.HTTPToken != "" {
-			if r.Header.Get("Authorization") != "Bearer "+s.cfg.HTTPToken {
-				http.Error(w, "unauthorized", http.StatusUnauthorized)
-				return
-			}
+		if s.cfg.HTTPToken != "" && r.Header.Get("Authorization") != "Bearer "+s.cfg.HTTPToken {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
 		}
 		h(w, r)
 	}
@@ -475,12 +626,6 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	json.NewEncoder(w).Encode(v)
-}
-
-func (s *Server) lineByID(id string) *Line {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.lines[id]
 }
 
 func (s *Server) hLines(w http.ResponseWriter, r *http.Request) {
@@ -496,9 +641,9 @@ func (s *Server) hLines(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) hSMS(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Line   string `json:"line"`
-		To     string `json:"to"`
-		Text   string `json:"text"`
+		Line string `json:"line"`
+		To   string `json:"to"`
+		Text string `json:"text"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, 400, map[string]string{"error": "bad json"})
@@ -513,12 +658,16 @@ func (s *Server) hSMS(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 404, map[string]string{"error": "no alive line"})
 		return
 	}
-	status, err := s.sendSMS(ln, req.To, req.Text)
-	if err != nil {
-		writeJSON(w, 500, map[string]string{"error": err.Error(), "line": ln.ID})
-		return
+	ok, smsNo, detail := s.sendSMS(ln, req.To, req.Text)
+	resp := map[string]any{"line": ln.ID}
+	if ok {
+		resp["status"] = "sent"
+		resp["sms_no"] = smsNo
+	} else {
+		resp["status"] = "failed"
+		resp["error"] = detail
 	}
-	writeJSON(w, 200, map[string]string{"status": status, "line": ln.ID})
+	writeJSON(w, 200, resp)
 }
 
 func (s *Server) hUSSD(w http.ResponseWriter, r *http.Request) {
@@ -570,7 +719,7 @@ func (s *Server) pickLine(id string) *Line {
 }
 
 // ----------------------------------------------------------------------------
-// Webhook
+// Webhook + helpers + main
 // ----------------------------------------------------------------------------
 
 func (s *Server) webhook(payload map[string]any) {
@@ -583,18 +732,13 @@ func (s *Server) webhook(payload map[string]any) {
 	if s.cfg.WebhookToken != "" {
 		req.Header.Set("Authorization", "Bearer "+s.cfg.WebhookToken)
 	}
-	client := &http.Client{Timeout: 15 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
 	if err != nil {
 		log.Printf("webhook error: %v", err)
 		return
 	}
 	resp.Body.Close()
 }
-
-// ----------------------------------------------------------------------------
-// helpers + main
-// ----------------------------------------------------------------------------
 
 func atoi(s string) int { n, _ := strconv.Atoi(strings.TrimSpace(s)); return n }
 
@@ -628,8 +772,18 @@ func main() {
 
 	s := newServer(cfg)
 	s.conn = conn
-	log.Printf("goip-bridge listening on UDP %s (GoIP lines register here)", cfg.ListenUDP)
 
+	if cfg.DB != nil {
+		if err := s.initDB(); err != nil {
+			log.Printf("WARNING: MySQL disabled — connect failed: %v", err)
+		} else {
+			log.Printf("MySQL connected: %s@%s:%d/%s (inbox=%s outbox=%s)",
+				cfg.DB.User, cfg.DB.Host, cfg.DB.Port, cfg.DB.Name, cfg.DB.InboxTable, cfg.DB.OutboxTable)
+			go s.outboxLoop()
+		}
+	}
+
+	log.Printf("goip-bridge listening on UDP %s (GoIP lines register here)", cfg.ListenUDP)
 	go s.httpLoop()
 	s.udpLoop()
 }

@@ -5,7 +5,17 @@
   "webhook_url": "",
   "webhook_token": "",
   "send_timeout_sec": 45,
-  "ussd_timeout_sec": 60,
-  "retransmit_sec": 5,
+  "ussd_timeout_sec": 120,
+  "ussd_retransmit_sec": 60,
+  "db": {
+    "host": "127.0.0.1",
+    "port": 3306,
+    "user": "goip_bridge",
+    "password": "CHANGE_ME",
+    "name": "goip_go",
+    "inbox_table": "goip_inbox",
+    "outbox_table": "goip_outbox",
+    "poll_sec": 2
+  },
   "line_passwords": {}
 }
