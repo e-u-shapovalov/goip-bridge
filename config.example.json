@@ -1,0 +1,11 @@
+{
+  "listen_udp": ":44444",
+  "listen_http": "127.0.0.1:8080",
+  "http_token": "CHANGE_ME",
+  "webhook_url": "",
+  "webhook_token": "",
+  "send_timeout_sec": 45,
+  "ussd_timeout_sec": 60,
+  "retransmit_sec": 5,
+  "line_passwords": {}
+}

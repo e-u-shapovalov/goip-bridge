@@ -1,0 +1,9 @@
+# Compiled binaries
+/goip-bridge
+*.exe
+*.test
+*.out
+
+# Local runtime config and data (ship config.example.json instead)
+/config.json
+*.db
