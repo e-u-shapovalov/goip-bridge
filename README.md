@@ -1,287 +1,411 @@
-# goip-bridge - SMS и USSD API для GoIP без MySQL, Apache и goipcron
+# goip-bridge - SMS/USSD API, webhook и MySQL-очередь для GoIP
 
-**goip-bridge** - легкий standalone-шлюз для GSM-шлюзов **GoIP DBL/Hybertone**. Он подключает железный GoIP к понятному HTTP API: принимает SMS, отправляет SMS, выполняет USSD-запросы и передает входящие события в ваш вебхук.
+**goip-bridge** - это легкий серверный шлюз для аппаратных GSM-шлюзов **GoIP DBL / Hybertone**. Он подключает GoIP к современному приложению: принимает SMS, отправляет SMS, выполняет USSD-запросы, отдает HTTP API, отправляет webhook и, при необходимости, работает с MySQL-очередью входящих и исходящих сообщений.
 
-Если коротко: вы ставите один бинарный файл на Linux-сервер, указываете его как **SMS Server** в настройках GoIP и получаете простой API для интеграции GoIP с CRM, ботом, биллингом, мониторингом, внутренней панелью или любым backend-сервисом.
+Если коротко: вы запускаете один бинарный файл на Linux-сервере, указываете этот сервер в настройках **SMS Server** на GoIP и получаете понятный **GoIP SMS API** для CRM, биллинга, Telegram-бота, мониторинга, helpdesk или своего backend-сервиса.
 
 English version: [README.en.md](README.en.md)
 
-## Скачать готовую программу
+## Скачать за 10 секунд
 
-Если вы обычный пользователь и просто хотите запустить программу, **не нажимайте `Code -> Download ZIP`**. Эта кнопка скачивает исходный код, а не готовую программу.
+Обычному пользователю не нужен Git и не нужна сборка из исходников.
 
-Нужно скачать готовый релиз:
+1. Откройте **GitHub Releases**: <https://github.com/e-u-shapovalov/goip-bridge/releases>
+2. Откройте последний релиз, сейчас это **v0.3.0**.
+3. В блоке **Assets** скачайте файл **`goip-bridge`**.
+4. **Не скачивайте `Source code (zip)` и `Source code (tar.gz)`**, если хотите просто запустить программу.
+5. **Не нажимайте `Code -> Download ZIP`** - это исходный код, а не готовая программа.
 
-1. Откройте страницу проекта на GitHub.
-2. Справа найдите блок **Releases**.
-3. Нажмите **Latest** или нужную версию, например `v0.1.0`.
-4. Внизу релиза откройте **Assets**.
-5. Скачайте файл с названием вроде `goip-bridge`, `goip-bridge-linux-amd64` или `goip-bridge-linux-amd64.tar.gz`.
-6. **Не скачивайте `Source code (zip)` и `Source code (tar.gz)`**, если вам нужна готовая программа.
+Прямая ссылка на готовый бинарник `v0.3.0` для Linux x86-64 / amd64:
 
-Подробная инструкция для новичков: [DOWNLOAD.md](DOWNLOAD.md)
+<https://github.com/e-u-shapovalov/goip-bridge/releases/download/v0.3.0/goip-bridge>
 
-Если в разделе Releases нет готового файла `goip-bridge`, значит релиз еще не опубликован или к нему не прикрепили бинарник. В этом случае разработчик должен собрать программу из исходников или добавить готовый asset к GitHub Release.
+Подробно для новичка: [DOWNLOAD.md](DOWNLOAD.md)
 
-## Что умеет goip-bridge
+## Что решает проект
 
-- Принимает регистрацию линий GoIP по UDP keepalive, по умолчанию на порту `44444`.
-- Показывает активные линии через `GET /lines`.
-- Принимает входящие SMS от GoIP и хранит последние 500 сообщений в памяти.
-- Отправляет входящие SMS во внешний webhook.
-- Отправляет SMS через HTTP-запрос `POST /sms`.
-- Выполняет USSD-команды через `POST /ussd`, например запрос баланса.
-- Принимает отчеты о доставке SMS, DLR, и отправляет их в webhook.
-- Защищает HTTP API bearer-токеном.
-- Работает без базы данных, MySQL, Apache, PHP и внешних сервисов.
-- Собирается в один статический бинарный файл.
+GoIP умеет работать как SMS-шлюз, но интеграция часто превращается в ручной веб-интерфейс, старые скрипты, `goipcron`, MySQL-таблицы непонятного формата и хрупкую обвязку. `goip-bridge` делает схему проще:
+
+```text
+GoIP DBL / Hybertone -> goip-bridge -> HTTP API / webhook / MySQL -> ваше приложение
+```
+
+Вместо ручной проверки SMS в панели GoIP вы получаете JSON-запросы, webhook-события и очередь сообщений, которую можно подключить к любой системе.
+
+## Возможности
+
+- Прием регистрации линий GoIP по UDP SMS Server protocol, по умолчанию порт `44444`.
+- `GET /lines` - список линий, сигнал, IMEI/IMSI/ICCID, оператор, статус `alive`.
+- Прием входящих SMS от GoIP.
+- `/inbox` - последние 500 входящих SMS в памяти процесса.
+- Webhook для входящих SMS и delivery reports, DLR.
+- `POST /sms` - отправка SMS через HTTP API.
+- `POST /ussd` - USSD-запросы, например проверка баланса.
+- Bearer-токен для защиты HTTP API.
+- Опциональная MySQL-интеграция:
+  - входящие SMS пишутся в `goip_inbox`;
+  - исходящие SMS берутся из очереди `goip_outbox`;
+  - статусы обновляются как `sent`, `delivered` или `failed`.
+- Один исполняемый файл для Linux x86-64 / amd64.
+- Подходит как замена старой связке `goipcron + Apache/PHP + MySQL`, если вам нужен более понятный сервис.
+
+Используйте проект только для законных сценариев и с согласия получателей сообщений.
 
 ## Кому это нужно
 
-**goip-bridge** полезен, если у вас уже есть аппаратный GSM-шлюз GoIP и нужно нормально подключить его к современному приложению:
+- Владельцам GoIP DBL / Hybertone, которым нужен нормальный **GoIP SMS gateway**.
+- Разработчикам CRM, ботов, личных кабинетов, мониторинга и внутренних панелей.
+- Администраторам, которые хотят принимать SMS с SIM-карт в свой backend.
+- Командам, которым нужна отправка сервисных SMS через собственный GoIP.
+- Тем, кто хочет заменить ручной веб-интерфейс GoIP на HTTP API и webhook.
+- Тем, кому нужна MySQL-очередь SMS, но без старого `goipcron`.
 
-- принимать SMS с SIM-карт в CRM, helpdesk, Telegram-бот или backend;
-- отправлять сервисные и транзакционные SMS через собственный GoIP;
-- проверять баланс SIM-карт через USSD;
-- заменить старую связку `goipcron + MySQL + Apache/PHP`;
-- сделать простой SMS gateway / SMS API поверх GoIP;
-- получать входящие SMS и DLR через webhook без ручной проверки веб-интерфейса устройства.
-
-Используйте программу только для легальных сценариев и с согласия получателей сообщений.
-
-## Почему это проще ручного способа
-
-Без bridge обычно приходится заходить в веб-интерфейс GoIP, разбираться со старым goipcron, поднимать базу данных и писать скрипты вокруг чужой схемы. Здесь схема проще:
-
-`GoIP -> goip-bridge -> HTTP API / webhook -> ваше приложение`
-
-Один конфиг, один процесс, понятные JSON-запросы.
-
-## Скриншоты и схема
-
-У `goip-bridge` нет графического интерфейса: это серверный сервис и HTTP API. Для GitHub-страницы полезнее показать схему работы, пример ответа API и экран настройки SMS Server в GoIP.
+## Схема работы
 
 ```mermaid
 flowchart LR
     A[GoIP DBL / Hybertone] -->|UDP SMS Server :44444| B[goip-bridge]
-    B -->|HTTP API| C[CRM / backend / bot]
-    B -->|webhook: SMS + DLR| D[Ваше приложение]
+    B -->|HTTP API: /sms /ussd /lines /inbox| C[CRM / bot / backend]
+    B -->|webhook: SMS + DLR| D[Ваш webhook]
+    B <-->|optional MySQL inbox/outbox| E[(MySQL / MariaDB)]
 ```
 
-Рекомендуемые изображения для будущего релиза:
+Для первого запуска полезнее смотреть схему как чеклист:
 
-- `docs/screenshots/goip-sms-server-settings.png` - где в GoIP указать SMS Server IP/Port.
-- `docs/screenshots/lines-api-response.png` - пример `GET /lines`.
-- `docs/screenshots/inbound-sms-webhook.png` - пример входящей SMS в принимающем сервисе.
+```mermaid
+flowchart TD
+    A[Скачать goip-bridge из Releases -> Assets] --> B[chmod +x goip-bridge]
+    B --> C[Создать config.json]
+    C --> D[Запустить ./goip-bridge -config config.json]
+    D --> E[Открыть UDP 44444 в firewall]
+    E --> F[В GoIP включить SMS Server]
+    F --> G[curl GET /lines]
+    G --> H{alive=true?}
+    H -- да --> I[POST /sms или MySQL queue]
+    H -- нет --> J[Проверить IP, порт, firewall, route, GSM LOGIN]
+```
 
-## Быстрый запуск готового релиза на Linux
+Больше схем для студентов и администраторов: [SCHEMES.md](SCHEMES.md)
 
-Готовый релиз сейчас ориентирован на **Linux x86-64 / amd64**.
+Пример реальной страницы GoIP SMS:
 
-1. Скачайте бинарник из **GitHub Releases**, не из `Code -> Download ZIP`.
-2. Положите рядом файл `config.json`. Пример есть в [config.example.json](config.example.json).
-3. Отредактируйте токен и адреса:
+![GoIP SMS Server settings](docs/screenshots/goip-sms-server-settings.png)
+
+На скриншоте верхняя информация устройства скрыта, а рабочие поля оставлены: `SMS Server`, `SMS Server IP`, `SMS Server Port`, `SMS Client ID`, `Password`, `Save Changes`.
+
+Скриншоты, которые полезно добавить в будущем:
+
+- `docs/screenshots/lines-api-response.png` - пример ответа `GET /lines`.
+- `docs/screenshots/mysql-outbox.png` - очередь исходящих SMS в MySQL.
+
+## Быстрый запуск без MySQL
+
+Это самый простой путь для первого запуска: HTTP API + webhook, без базы данных.
+
+```sh
+mkdir -p /opt/goip-bridge
+cd /opt/goip-bridge
+curl -L -o goip-bridge https://github.com/e-u-shapovalov/goip-bridge/releases/download/v0.3.0/goip-bridge
+chmod +x goip-bridge
+```
+
+Создайте файл `config.json` рядом с бинарником:
 
 ```json
 {
   "listen_udp": ":44444",
   "listen_http": "127.0.0.1:8080",
-  "http_token": "CHANGE_ME",
+  "http_token": "CHANGE_ME_TO_LONG_RANDOM_TOKEN",
   "webhook_url": "",
   "webhook_token": "",
   "send_timeout_sec": 45,
-  "ussd_timeout_sec": 60,
-  "retransmit_sec": 5,
+  "ussd_timeout_sec": 120,
+  "ussd_retransmit_sec": 60,
+  "debug": false,
+  "log_max_mb": 10,
+  "line_dead_after_sec": 120,
+  "allow_src": [],
   "line_passwords": {}
 }
 ```
 
-4. Дайте файлу право на запуск и стартуйте сервис:
+Что важно в конфиге:
+
+- `http_token` - bearer-токен для HTTP API. Пустая строка = API без авторизации; если при этом `listen_http` не loopback, bridge выведет предупреждение в лог при старте.
+- `line_passwords` - ручное переопределение пароля линии (используется и для SMS, и для USSD). Обычно bridge берет пароль из keepalive GoIP, но если устройство не передает пароль или нужен фиксированный пароль, добавьте `"Go1": "secret"`.
+- `ussd_retransmit_sec` не стоит делать слишком маленьким: bridge повторит USSD-команду, если оператор не ответил за это время, а слишком частые повторы создают новую USSD-сессию поверх ещё открытой и ломают ответ.
+- `debug` - подробный лог приёма и отправки SMS и USSD (keepalive не логируется). Пишется в файлы рядом с `config.json`, см. `log_max_mb`.
+- `log_max_mb` - размер каждого лог-файла до ротации, МБ (по умолчанию 10). Bridge пишет `goip-bridge.log` и `goip-bridge.err.log` рядом с конфигом; при превышении старый файл переименовывается в `.log.1` (хранится одна предыдущая копия). Файлы создаются с правами `0600`, так как содержат номера и тексты SMS.
+- `line_dead_after_sec` - через сколько секунд без keepalive линия считается «не живой» (по умолчанию 120). Влияет на поле `alive` в `/lines`, на `/health` и на авто-выбор линии при пустом `line`.
+- `allow_src` - список IP или CIDR, с которых принимаются UDP-пакеты от GoIP, например `["10.0.0.200", "192.168.1.0/24"]`. Пустой список = принимать с любого адреса (тогда единственная защита - firewall). Пакеты с других адресов молча отбрасываются.
+
+Запустите:
 
 ```sh
-chmod +x goip-bridge
 ./goip-bridge -config config.json
 ```
 
-5. В веб-интерфейсе GoIP откройте настройки SMS нужного канала и укажите:
+В логе должны появиться строки примерно такого вида. Первая строка - это «первое эхо»: она показывает название, версию и копирайт того бинарника, который реально запустился.
 
 ```text
-SMS Server IP: IP-адрес сервера, где запущен goip-bridge
-SMS Server Port: 44444
-Client ID / Password: как настроено на линии GoIP
+goip-bridge v0.3.0 — GoIP SMS/USSD gateway. Copyright (c) 2026 Evgenii Shapovalov
+logging to /opt/goip-bridge (goip-bridge.log + .err.log, cap 10 MB, debug=false)
+goip-bridge listening on UDP :44444 (GoIP lines register here)
+HTTP API on 127.0.0.1:8080
 ```
 
-6. Проверьте, что линия появилась:
+Версию также можно узнать без запуска сервиса:
 
 ```sh
-curl -H "Authorization: Bearer CHANGE_ME" http://127.0.0.1:8080/lines
+./goip-bridge -version
 ```
 
-Более подробная установка и диагностика: [INSTALL.md](INSTALL.md)
+## Что настроить в GoIP
+
+В веб-интерфейсе GoIP откройте настройки SMS нужной линии или канала и укажите:
+
+```text
+SMS Server: Enable
+SMS Server IP: IP-адрес Linux-сервера, где запущен goip-bridge
+SMS Server Port: 44444
+SMS Client ID: идентификатор линии, например Go1
+Password: пароль линии
+```
+
+После изменения нажмите **Save Changes**. Если есть кнопка `*Auto Config Other lines`, нажимайте ее только когда хотите применить похожие настройки к другим каналам GoIP.
+
+После этого GoIP должен отправить keepalive на `goip-bridge`. Проверка:
+
+```sh
+curl -H "Authorization: Bearer CHANGE_ME_TO_LONG_RANDOM_TOKEN" http://127.0.0.1:8080/lines
+```
+
+Если все хорошо, вы увидите JSON со строкой линии и `"alive": true`.
 
 ## HTTP API
 
-Все запросы используют JSON. Если в `config.json` задан `http_token`, добавляйте заголовок:
+Если в `config.json` задан `http_token`, добавляйте заголовок:
 
 ```text
-Authorization: Bearer CHANGE_ME
+Authorization: Bearer CHANGE_ME_TO_LONG_RANDOM_TOKEN
 ```
 
-### Список линий
+Список линий:
 
 ```sh
-curl -H "Authorization: Bearer CHANGE_ME" http://127.0.0.1:8080/lines
+curl -H "Authorization: Bearer CHANGE_ME_TO_LONG_RANDOM_TOKEN" http://127.0.0.1:8080/lines
 ```
 
-### Отправить SMS
+Отправить SMS:
 
 ```sh
 curl -X POST http://127.0.0.1:8080/sms \
-  -H "Authorization: Bearer CHANGE_ME" \
+  -H "Authorization: Bearer CHANGE_ME_TO_LONG_RANDOM_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"line":"Go1","to":"996700000001","text":"Test message"}'
 ```
 
-Если `line` оставить пустой, bridge выберет первую живую линию.
+Если `line` оставить пустой, bridge выберет одну из живых линий. Порядок выбора не гарантирован, поэтому для production лучше указывать конкретную линию, например `Go1`.
 
-### Выполнить USSD
+Важно: если GoIP не подтвердил отправку, `/sms` все равно может вернуть HTTP `200`, но с JSON `{"status":"failed","error":"..."}`. В интеграции проверяйте поле `status`, а не только HTTP-код.
+
+USSD:
 
 ```sh
 curl -X POST http://127.0.0.1:8080/ussd \
-  -H "Authorization: Bearer CHANGE_ME" \
+  -H "Authorization: Bearer CHANGE_ME_TO_LONG_RANDOM_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"line":"Go1","code":"*100#"}'
 ```
 
-### Получить последние входящие SMS
+Последние входящие SMS:
 
 ```sh
-curl -H "Authorization: Bearer CHANGE_ME" http://127.0.0.1:8080/inbox
+curl -H "Authorization: Bearer CHANGE_ME_TO_LONG_RANDOM_TOKEN" http://127.0.0.1:8080/inbox
 ```
 
-## Webhook для входящих SMS и DLR
+Полное описание API: [API.md](API.md)
 
-Если в `config.json` задан `webhook_url`, bridge отправляет туда `POST` с JSON.
+## MySQL-режим
 
-Входящая SMS:
+MySQL не обязателен. Если блок `db` отсутствует в `config.json`, `goip-bridge` работает только через HTTP API, webhook и память.
 
-```json
-{
-  "type": "sms",
-  "line": "Go1",
-  "from": "+996555111222",
-  "text": "Message text",
-  "time": "2026-06-09T18:00:00Z"
-}
+Если нужен привычный режим очереди:
+
+- входящие SMS записываются в таблицу `goip_inbox`;
+- исходящие SMS кладутся в `goip_outbox` со статусом `queued`;
+- bridge сам забирает очередь, отправляет SMS и обновляет статус.
+
+Быстро создать базу, пользователя и таблицы:
+
+```sh
+sudo mysql < mysql.schema.sql
 ```
 
-Отчет о доставке:
+Имена по умолчанию:
 
-```json
-{
-  "type": "dlr",
-  "line": "Go1",
-  "sms_no": "123",
-  "state": "DELIVRD",
-  "time": "2026-06-09T18:00:00Z"
-}
+```text
+database:      goip_go
+db user:       goip_bridge
+inbox table:   goip_inbox
+outbox table:  goip_outbox
 ```
+
+Подробная схема таблиц, SQL-команды и примеры `INSERT`: [MYSQL.md](MYSQL.md)
+
+Схема MySQL-очереди: [SCHEMES.md#6-отправка-sms-через-mysql-очередь](SCHEMES.md#6-отправка-sms-через-mysql-очередь)
+
+Runtime-детали MySQL-режима: максимум 8 открытых DB-соединений, максимум 8 параллельных отправок SMS, DLR retry до 6 попыток с паузой 1.5 секунды.
+
+Если MySQL временно недоступен, bridge не сдаётся: подключение к базе он повторяет в фоне каждые 15 секунд. А данные, которые не удалось записать за несколько попыток (входящая SMS, статус отправки, delivery report), дописываются в файл `goip-bridge.fallback.jsonl` рядом с конфигом - чтобы ничего не потерялось молча. Этот файл только для ручного разбора и не применяется к базе автоматически. Подробнее: [MYSQL.md](MYSQL.md).
+
+## Установка как systemd-сервис
+
+Для постоянной работы на сервере используйте systemd:
+
+```sh
+sudo useradd --system --home /opt/goip-bridge --shell /usr/sbin/nologin goip-bridge
+sudo mkdir -p /opt/goip-bridge
+sudo cp goip-bridge config.json /opt/goip-bridge/
+sudo chown -R goip-bridge:goip-bridge /opt/goip-bridge
+sudo cp goip-bridge.service /etc/systemd/system/goip-bridge.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now goip-bridge
+```
+
+Логи:
+
+```sh
+sudo journalctl -u goip-bridge -f
+```
+
+Подробная установка: [INSTALL.md](INSTALL.md)
+
+## Firewall и сеть
+
+GoIP должен достучаться до сервера по **UDP `44444`**. Если firewall режет этот порт, `/lines` будет пустым.
+
+Минимально для `ufw`:
+
+```sh
+sudo ufw allow 44444/udp
+```
+
+Для `nftables` правило нужно сохранить в `/etc/nftables.conf` и включить автозагрузку:
+
+```sh
+sudo nft -f /etc/nftables.conf
+sudo systemctl enable --now nftables
+sudo nft list ruleset | grep 44444
+```
+
+HTTP API `8080` открывайте только если API нужен с другой машины. MySQL/MariaDB `3306` обычно не открывают наружу, если база стоит на том же сервере.
+
+Подробно: [FIREWALL.md](FIREWALL.md)
 
 ## Для разработчиков
 
-Нужен Go 1.21 или новее.
+Нужен Go **1.24** или новее, потому что `go.mod` проекта указывает `go 1.24.0`.
 
 ```sh
 git clone https://github.com/e-u-shapovalov/goip-bridge.git
 cd goip-bridge
-cp config.example.json config.json
+cp config.no-mysql.example.json config.json
 go run . -config config.json
 ```
 
-Сборка статического бинарника для Linux:
+Сборка Linux x86-64 / amd64:
 
 ```sh
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o goip-bridge .
 ```
 
+Проверка зависимостей:
+
+```sh
+go mod tidy
+go test ./...
+```
+
 ## Ограничения
 
-- Нужен аппаратный GoIP/DBL/Hybertone, который поддерживает UDP-протокол **SMS Server**.
-- `goip-bridge` не является SMPP-сервером. Он дает HTTP API и webhook поверх GoIP.
-- Встроенный `/inbox` хранит последние 500 входящих SMS в памяти. После перезапуска история очищается.
-- Длинные SMS режет и собирает само устройство GoIP. Bridge работает с уже готовым текстом сообщения.
-- Версия `0.1.0` - ранний релиз. Перед рабочим использованием проверьте поведение на своей модели GoIP и своей сети.
+- Нужен аппаратный GoIP / DBL / Hybertone с поддержкой режима **SMS Server**.
+- Это не SMPP-сервер. Проект дает HTTP API, webhook и MySQL-очередь поверх GoIP.
+- `/inbox` хранит только последние 500 SMS в памяти. После перезапуска память очищается.
+- Постоянное хранение входящих SMS включайте через MySQL.
+- Длинные SMS обычно собирает или режет само устройство GoIP. Bridge работает с тем текстом, который получил от устройства.
+- Проверяйте свою модель GoIP, прошивку, SIM-карты и оператора перед production-запуском.
 
 ## FAQ
 
 ### Мне нужен Git?
 
-Нет, если вы скачиваете готовый релиз. Git нужен только разработчикам, которые хотят менять код или собирать программу сами.
+Нет. Git нужен только разработчику. Обычный пользователь скачивает файл `goip-bridge` из **Releases -> Assets**.
 
-### Что скачивать на GitHub?
+### Что именно скачивать на GitHub?
 
-Скачивайте файл из **Releases -> Assets**. Для обычного пользователя правильный файл содержит `goip-bridge` и часто `linux-amd64` в названии. Не скачивайте `Source code`.
-
-### Почему `Code -> Download ZIP` не подходит?
-
-Потому что это архив исходного кода. Внутри нет готовой установленной программы. Такой архив нужен разработчикам.
+Скачивайте asset `goip-bridge` из релиза `v0.3.0` или более нового. Не скачивайте `Source code` и не используйте `Code -> Download ZIP`.
 
 ### Можно ли запустить на Windows?
 
-Код Go технически переносимый, но готовый релиз в проекте описан как Linux x86-64. Для обычной установки используйте Linux-сервер, VPS или мини-ПК в сети с GoIP.
+Текущий готовый релиз опубликован как Linux x86-64 / amd64 бинарник. Запускайте его на Linux-сервере, VPS, мини-ПК или виртуальной машине в сети с GoIP.
+
+### Нужен ли MySQL?
+
+Нет, если вам хватает HTTP API, webhook и `/inbox` в памяти. MySQL нужен, если вы хотите очередь исходящих SMS в таблице и постоянное хранение входящих SMS.
 
 ### Как узнать имя линии?
 
-Запустите bridge, настройте GoIP на отправку keepalive в `listen_udp`, затем откройте:
+Запустите bridge, настройте GoIP на `SMS Server IP` и `SMS Server Port`, затем выполните:
 
 ```sh
-curl -H "Authorization: Bearer CHANGE_ME" http://127.0.0.1:8080/lines
+curl -H "Authorization: Bearer CHANGE_ME_TO_LONG_RANDOM_TOKEN" http://127.0.0.1:8080/lines
 ```
 
-В ответе будет поле `id`, например `Go1`.
+Поле `id` - это имя линии, например `Go1`.
 
-### Нужна ли база данных?
+### Где смотреть логи?
 
-Нет. Программа специально сделана без MySQL и других внешних зависимостей.
+Если запустили вручную, логи идут прямо в терминал. Если запустили через systemd:
+
+```sh
+sudo journalctl -u goip-bridge -f
+```
 
 ## Диагностика
 
-### `/lines` возвращает пустой список
+Коротко:
 
-Проверьте, что в GoIP указан правильный `SMS Server IP` и порт `44444`, сервер доступен по UDP, firewall не блокирует порт, а GoIP и сервер видят друг друга по сети.
+- `unauthorized` - неправильный `Authorization: Bearer ...`.
+- `/lines` пустой - GoIP не дошел до UDP-порта `44444`.
+- `no alive line` - нет зарегистрированной линии со статусом `LOGIN`.
+- `ussd timeout` - устройство или оператор не ответили за `ussd_timeout_sec`.
+- `WARNING: MySQL connect failed, retrying in background` - блок `db` есть, но подключение не прошло; bridge повторяет подключение каждые 15 секунд, HTTP API при этом работает.
 
-### Ответ `unauthorized`
+Полный разбор проблем: [TROUBLESHOOTING.md](TROUBLESHOOTING.md)
 
-Токен в заголовке не совпадает с `http_token` в `config.json`. Проверьте формат:
+Firewall, `nftables`, `ufw`, маршруты и проверка после ребута: [FIREWALL.md](FIREWALL.md)
 
-```text
-Authorization: Bearer CHANGE_ME
-```
+Визуальные схемы запуска, портов, MySQL и systemd: [SCHEMES.md](SCHEMES.md)
 
-### Ответ `no alive line`
-
-Bridge не видит живую линию. Обычно это значит, что GoIP еще не прислал keepalive, линия не в статусе `LOGIN` или указан неправильный `line`.
-
-### USSD уходит в timeout
-
-Проверьте GSM-сеть, баланс SIM-карты, доступность USSD-кода у оператора и параметр `ussd_timeout_sec`.
-
-### Webhook не получает события
-
-Проверьте `webhook_url`, доступность URL с сервера, HTTPS-сертификат, firewall и `webhook_token`, если приемник требует авторизацию.
+Релизы и публикация assets: [RELEASES.md](RELEASES.md)
 
 ## SEO: как это ищут
 
-Проект закрывает задачи, которые часто ищут как **GoIP SMS API**, **GoIP SMS gateway**, **GoIP webhook incoming SMS**, **GoIP USSD API**, **отправка SMS через GoIP**, **прием SMS с GoIP**, **HTTP API для GSM шлюза**, **замена goipcron**, **GoIP без MySQL**, **GSM modem SMS gateway**.
+Проект закрывает задачи, которые обычно ищут как **GoIP SMS API**, **GoIP SMS gateway**, **GoIP HTTP API**, **GoIP webhook incoming SMS**, **GoIP USSD API**, **отправка SMS через GoIP**, **прием SMS с GoIP**, **HTTP API для GSM шлюза**, **MySQL очередь SMS**, **замена goipcron**, **GoIP без Apache/PHP**, **GSM modem SMS gateway**.
 
-Текст написан без спама: поисковикам важны первые абзацы, понятные заголовки, реальные сценарии использования и совпадение терминов с тем, как пользователи описывают проблему.
+Текст использует реальные термины проекта без спама: GoIP, DBL, Hybertone, SMS Server, UDP keepalive, HTTP API, webhook, DLR, USSD, MySQL inbox/outbox.
 
-## Статус релиза
+## Релизы
 
-Этот коммит меняет только документацию. Версия релиза не меняется. Перед продвижением проекта проверьте страницу **Releases** и убедитесь, что к текущему релизу прикреплен готовый asset для Linux x86-64.
+Опубликованы релизы `v0.1.0`, `v0.2.0` и `v0.3.0`. Последний релиз `v0.3.0` содержит готовый asset `goip-bridge` размером около 10 MB для Linux x86-64 / amd64.
+
+Страница релизов: <https://github.com/e-u-shapovalov/goip-bridge/releases>
 
 ## Лицензия и связь
 
-Лицензия в локальной копии репозитория не найдена. Перед публичным использованием желательно добавить `LICENSE`, например MIT или Apache-2.0, если это соответствует вашим планам.
+Файл `LICENSE` в локальной копии не найден. Перед активным публичным продвижением проекта стоит добавить лицензию, например MIT или Apache-2.0, если это соответствует вашим планам.
 
-Автор указан в module path: `github.com/e-u-shapovalov/goip-bridge`. Для вопросов, багов и предложений лучше использовать GitHub Issues.
+Автор и репозиторий: <https://github.com/e-u-shapovalov/goip-bridge>
+
+Для багов, вопросов и предложений используйте GitHub Issues.

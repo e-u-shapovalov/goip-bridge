@@ -1,16 +1,20 @@
 [Unit]
 Description=goip-bridge - GoIP SMS/USSD gateway
-After=network-online.target nftables.service mariadb.service
+After=network-online.target nftables.service mariadb.service mysql.service
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=link
-Group=link
-WorkingDirectory=/var/www/goip-bridge
-ExecStart=/var/www/goip-bridge/goip-bridge -config /var/www/goip-bridge/config.json
+User=goip-bridge
+Group=goip-bridge
+WorkingDirectory=/opt/goip-bridge
+ExecStart=/opt/goip-bridge/goip-bridge -config /opt/goip-bridge/config.json
 Restart=always
 RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
 
 [Install]
 WantedBy=multi-user.target

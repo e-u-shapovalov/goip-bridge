@@ -7,6 +7,10 @@
   "send_timeout_sec": 45,
   "ussd_timeout_sec": 120,
   "ussd_retransmit_sec": 60,
+  "debug": false,
+  "log_max_mb": 10,
+  "line_dead_after_sec": 120,
+  "allow_src": [],
   "db": {
     "host": "127.0.0.1",
     "port": 3306,

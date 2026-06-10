@@ -1,139 +1,175 @@
-# goip-bridge - GoIP SMS and USSD API without MySQL, Apache or goipcron
+# goip-bridge - GoIP SMS/USSD API, webhooks and optional MySQL queue
 
-**goip-bridge** is a lightweight standalone gateway for **GoIP DBL/Hybertone** GSM gateways. It connects a physical GoIP device to a simple HTTP API: receive SMS, send SMS, run USSD commands and forward inbound events to a webhook.
+**goip-bridge** is a lightweight server-side gateway for **GoIP DBL / Hybertone** GSM devices. It turns the GoIP SMS Server UDP protocol into a practical HTTP API, incoming SMS webhooks, USSD requests and an optional MySQL inbox/outbox queue.
 
-In practice, you run one binary on a Linux server, configure it as the **SMS Server** in the GoIP web interface, and use JSON over HTTP from your CRM, bot, billing system, monitoring tool or backend service.
+Run one binary on a Linux server, point the GoIP channel's **SMS Server IP/Port** to it, and integrate SMS with your CRM, bot, billing system, monitoring stack or backend service.
 
 Main Russian README: [README.md](README.md)
 
+Visual schemes and first-run maps: [SCHEMES.md](SCHEMES.md)
+
 ## Download
 
-If you just want to run the program, **do not use `Code -> Download ZIP`**. That downloads the source code, not the ready-to-run program.
+For normal users, no Git and no source build are required.
 
-Download a release build instead:
+1. Open GitHub Releases: <https://github.com/e-u-shapovalov/goip-bridge/releases>
+2. Open the latest release, currently **v0.2.0**.
+3. Download the **`goip-bridge`** file from **Assets**.
+4. Do not download `Source code (zip)` or `Source code (tar.gz)` unless you want to build from source.
+5. Do not use `Code -> Download ZIP` if you only need the ready-to-run program.
 
-1. Open the GitHub project page.
-2. Find **Releases** on the right side.
-3. Open **Latest** or a specific version, for example `v0.1.0`.
-4. Scroll to **Assets**.
-5. Download a file named like `goip-bridge`, `goip-bridge-linux-amd64` or `goip-bridge-linux-amd64.tar.gz`.
-6. Do not download `Source code (zip)` or `Source code (tar.gz)` unless you are a developer.
+Direct Linux x86-64 / amd64 binary:
 
-Beginner-friendly guide: [DOWNLOAD.md](DOWNLOAD.md)
+<https://github.com/e-u-shapovalov/goip-bridge/releases/download/v0.2.0/goip-bridge>
 
-If there is no `goip-bridge` binary under release assets, the release has not been published with a ready build yet.
+Beginner download guide: [DOWNLOAD.md](DOWNLOAD.md)
 
 ## Features
 
-- Registers GoIP lines via UDP keepalive, default port `44444`.
-- Lists active lines via `GET /lines`.
+- Registers GoIP lines via the UDP SMS Server protocol, default port `44444`.
+- Lists live lines via `GET /lines`.
 - Receives inbound SMS from GoIP.
-- Stores the latest 500 inbound messages in memory.
-- Sends inbound SMS and delivery reports to an outgoing webhook.
+- Keeps the latest 500 inbound messages in memory via `GET /inbox`.
+- Sends inbound SMS and DLR events to an outgoing webhook.
 - Sends SMS via `POST /sms`.
 - Runs USSD commands via `POST /ussd`.
 - Protects the HTTP API with a bearer token.
-- Works without MySQL, Apache, PHP or external services.
-- Builds into a single static binary.
+- Optional MySQL integration:
+  - inbound SMS are inserted into `goip_inbox`;
+  - outbound SMS are read from `goip_outbox`;
+  - delivery status is written back as `sent`, `delivered` or `failed`.
+- Single Linux amd64 binary.
 
 ## Why use it
 
-Without a bridge, GoIP integrations often rely on the old goipcron stack, a database, web server setup and custom scripts. `goip-bridge` keeps the architecture much smaller:
+Many GoIP integrations end up with manual web UI checks, old `goipcron` setups, Apache/PHP scripts and fragile database glue. `goip-bridge` gives you a smaller architecture:
 
-`GoIP -> goip-bridge -> HTTP API / webhook -> your application`
-
-It is useful when you need a GoIP SMS gateway, a GoIP HTTP API, incoming SMS webhooks, USSD balance checks or a simpler replacement for goipcron.
-
-Use it only for lawful messaging scenarios and with recipient consent.
-
-## Quick start on Linux
-
-The prepared release target is **Linux x86-64 / amd64**.
-
-```sh
-chmod +x goip-bridge
-./goip-bridge -config config.json
+```text
+GoIP DBL / Hybertone -> goip-bridge -> HTTP API / webhook / MySQL -> your app
 ```
 
-Example `config.json`:
+Use it for lawful messaging only and with recipient consent.
+
+## Quick Start Without MySQL
+
+```sh
+mkdir -p /opt/goip-bridge
+cd /opt/goip-bridge
+curl -L -o goip-bridge https://github.com/e-u-shapovalov/goip-bridge/releases/download/v0.2.0/goip-bridge
+chmod +x goip-bridge
+```
+
+Create `config.json`:
 
 ```json
 {
   "listen_udp": ":44444",
   "listen_http": "127.0.0.1:8080",
-  "http_token": "CHANGE_ME",
+  "http_token": "CHANGE_ME_TO_LONG_RANDOM_TOKEN",
   "webhook_url": "",
   "webhook_token": "",
   "send_timeout_sec": 45,
-  "ussd_timeout_sec": 60,
-  "retransmit_sec": 5,
+  "ussd_timeout_sec": 120,
+  "ussd_retransmit_sec": 60,
   "line_passwords": {}
 }
 ```
 
-In the GoIP web interface, set the channel's **SMS Server IP/Port** to the server running `goip-bridge` and UDP port `44444`.
+Run:
+
+```sh
+./goip-bridge -config config.json
+```
+
+In the GoIP web interface, set the channel's **SMS Server IP** to the Linux server running `goip-bridge` and **SMS Server Port** to `44444`.
 
 Check registered lines:
 
 ```sh
-curl -H "Authorization: Bearer CHANGE_ME" http://127.0.0.1:8080/lines
+curl -H "Authorization: Bearer CHANGE_ME_TO_LONG_RANDOM_TOKEN" http://127.0.0.1:8080/lines
 ```
 
-Detailed setup: [INSTALL.md](INSTALL.md)
+Detailed installation guide: [INSTALL.md](INSTALL.md)
+
+Firewall note: the GoIP device must be able to reach UDP port `44444` on the bridge server. Keep HTTP `8080` private unless another host needs the API. Details: [FIREWALL.md](FIREWALL.md)
+
+For `/sms`, do not rely on HTTP `200` alone. Device-level send failures are returned as JSON with `status: "failed"` and an `error` field. If `line` is empty, the bridge picks one live line with no guaranteed order; specify `line` for deterministic routing.
 
 ## HTTP API
 
 Use `Authorization: Bearer <http_token>` when `http_token` is configured.
 
 ```sh
-curl -H "Authorization: Bearer CHANGE_ME" http://127.0.0.1:8080/lines
+curl -H "Authorization: Bearer CHANGE_ME_TO_LONG_RANDOM_TOKEN" http://127.0.0.1:8080/lines
 ```
 
 ```sh
 curl -X POST http://127.0.0.1:8080/sms \
-  -H "Authorization: Bearer CHANGE_ME" \
+  -H "Authorization: Bearer CHANGE_ME_TO_LONG_RANDOM_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"line":"Go1","to":"996700000001","text":"Test message"}'
 ```
 
 ```sh
 curl -X POST http://127.0.0.1:8080/ussd \
-  -H "Authorization: Bearer CHANGE_ME" \
+  -H "Authorization: Bearer CHANGE_ME_TO_LONG_RANDOM_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"line":"Go1","code":"*100#"}'
 ```
 
-```sh
-curl -H "Authorization: Bearer CHANGE_ME" http://127.0.0.1:8080/inbox
-```
+Full API reference: [API.md](API.md)
 
-## Developer build
+## MySQL Mode
 
-Requires Go 1.21 or newer.
+MySQL is optional. If the `db` section is absent from `config.json`, the bridge works with HTTP API, webhooks and in-memory inbox only.
+
+When MySQL is enabled, inbound SMS are inserted into `goip_inbox`, outbound messages are read from `goip_outbox`, and delivery status is written back to the same table.
+
+Schema and examples: [MYSQL.md](MYSQL.md)
+
+Current MySQL runtime limits: up to 8 open DB connections, up to 8 concurrent SMS sends, DLR matching retry up to 6 attempts with 1.5 seconds between attempts.
+
+## Developer Build
+
+Requires Go **1.24** or newer.
 
 ```sh
 git clone https://github.com/e-u-shapovalov/goip-bridge.git
 cd goip-bridge
-cp config.example.json config.json
+cp config.no-mysql.example.json config.json
 go run . -config config.json
 ```
 
-Static Linux build:
+Static Linux amd64 build:
 
 ```sh
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o goip-bridge .
 ```
 
+## Troubleshooting
+
+- `unauthorized`: wrong bearer token.
+- Empty `/lines`: GoIP is not reaching UDP port `44444`.
+- `no alive line`: no registered GoIP line is currently alive.
+- `ussd timeout`: the device or mobile operator did not answer in time.
+- `WARNING: MySQL connect failed, retrying in background`: the `db` section is configured but the connection failed; the bridge retries every 15 seconds and the HTTP API keeps working.
+
+Full troubleshooting guide: [TROUBLESHOOTING.md](TROUBLESHOOTING.md)
+
+Firewall, routes and boot-time checks: [FIREWALL.md](FIREWALL.md)
+
 ## Limitations
 
-- Requires a GoIP/DBL/Hybertone device that supports the UDP **SMS Server** protocol.
-- This is not an SMPP server. It provides HTTP API and webhooks on top of GoIP.
-- `/inbox` is in-memory only and keeps the latest 500 inbound messages.
-- Long SMS splitting/reassembly is handled by the GoIP device.
-- Version `0.1.0` is an early release. Test it with your own GoIP model and network before production use.
+- Requires a GoIP / DBL / Hybertone device with SMS Server support.
+- This is not an SMPP server.
+- `/inbox` is in-memory and stores the latest 500 messages only.
+- Persistent inbound SMS storage requires MySQL mode.
+- Test your own GoIP model, firmware, SIM cards and carrier before production use.
 
-## License and support
+## License and Support
 
-No license file was found in the local repository copy. Add a `LICENSE` file before public distribution.
+No `LICENSE` file was found in this local copy. Add one before serious public distribution.
 
-For bugs and feature requests, use GitHub Issues.
+Repository: <https://github.com/e-u-shapovalov/goip-bridge>
+
+Use GitHub Issues for bugs and feature requests.

@@ -7,3 +7,8 @@
 # Local runtime config and data (ship config.example.json instead)
 /config.json
 *.db
+
+# Runtime logs and the fallback journal (contain phone numbers and SMS text)
+*.log
+*.log.1
+goip-bridge.fallback.jsonl
