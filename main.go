@@ -39,14 +39,14 @@ import (
 )
 
 // Build/identity metadata. appVersion can be overridden at build time:
-//   go build -ldflags "-X main.appVersion=0.3.0" .
+//   go build -ldflags "-X main.appVersion=0.3.1" .
 const (
 	appName      = "goip-bridge"
 	appTagline   = "GoIP SMS/USSD gateway"
 	appCopyright = "Copyright (c) 2026 Evgenii Shapovalov"
 )
 
-var appVersion = "0.3.0"
+var appVersion = "0.3.1"
 
 // ----------------------------------------------------------------------------
 // Config

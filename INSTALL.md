@@ -43,7 +43,7 @@ cd /opt/goip-bridge
 ### 2. Скачайте готовый релиз
 
 ```sh
-curl -L -o goip-bridge https://github.com/e-u-shapovalov/goip-bridge/releases/download/v0.2.0/goip-bridge
+curl -L -o goip-bridge https://github.com/e-u-shapovalov/goip-bridge/releases/latest/download/goip-bridge
 chmod +x goip-bridge
 ```
 

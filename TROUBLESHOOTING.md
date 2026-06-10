@@ -334,7 +334,7 @@ sudo systemctl restart goip-bridge
 
 Скачайте готовый бинарник из релиза:
 
-<https://github.com/e-u-shapovalov/goip-bridge/releases/download/v0.2.0/goip-bridge>
+<https://github.com/e-u-shapovalov/goip-bridge/releases/latest/download/goip-bridge>
 
 Потом:
 

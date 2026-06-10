@@ -56,7 +56,7 @@ flowchart TD
 ```sh
 mkdir -p /opt/goip-bridge
 cd /opt/goip-bridge
-curl -L -o goip-bridge https://github.com/e-u-shapovalov/goip-bridge/releases/download/v0.2.0/goip-bridge
+curl -L -o goip-bridge https://github.com/e-u-shapovalov/goip-bridge/releases/latest/download/goip-bridge
 chmod +x goip-bridge
 nano config.json
 ./goip-bridge -config config.json

@@ -7,14 +7,14 @@
 ## Самая короткая инструкция
 
 1. Откройте страницу релизов: <https://github.com/e-u-shapovalov/goip-bridge/releases>
-2. Нажмите последний релиз, сейчас это **v0.3.0**.
+2. Нажмите последний релиз, сейчас это **v0.3.1**.
 3. Найдите блок **Assets**.
 4. Скачайте файл **`goip-bridge`**.
 5. Не скачивайте `Source code (zip)` и `Source code (tar.gz)`.
 
 Прямая ссылка на текущий готовый бинарник:
 
-<https://github.com/e-u-shapovalov/goip-bridge/releases/download/v0.3.0/goip-bridge>
+<https://github.com/e-u-shapovalov/goip-bridge/releases/latest/download/goip-bridge>
 
 ## Что скачивать
 
@@ -64,7 +64,7 @@ Code -> Download ZIP
 ```sh
 mkdir -p /opt/goip-bridge
 cd /opt/goip-bridge
-curl -L -o goip-bridge https://github.com/e-u-shapovalov/goip-bridge/releases/download/v0.3.0/goip-bridge
+curl -L -o goip-bridge https://github.com/e-u-shapovalov/goip-bridge/releases/latest/download/goip-bridge
 chmod +x goip-bridge
 ```
 
@@ -111,7 +111,7 @@ nano config.json
 Если видите такие строки, программа стартовала. Первая строка показывает версию, которая запустилась:
 
 ```text
-goip-bridge v0.3.0 — GoIP SMS/USSD gateway. Copyright (c) 2026 Evgenii Shapovalov
+goip-bridge v0.3.1 — GoIP SMS/USSD gateway. Copyright (c) 2026 Evgenii Shapovalov
 logging to /opt/goip-bridge (goip-bridge.log + .err.log, cap 10 MB, debug=false)
 goip-bridge listening on UDP :44444 (GoIP lines register here)
 HTTP API on 127.0.0.1:8080
@@ -144,7 +144,7 @@ curl -H "Authorization: Bearer CHANGE_ME_TO_LONG_RANDOM_TOKEN" http://127.0.0.1:
 
 ### В Assets есть только Source code
 
-Значит к этому релизу не прикрепили готовый бинарник. Для `v0.3.0` готовый asset `goip-bridge` опубликован. Для будущих релизов проверяйте блок **Assets**.
+Значит к этому релизу не прикрепили готовый бинарник. Для `v0.3.1` готовый asset `goip-bridge` опубликован. Для будущих релизов проверяйте блок **Assets**.
 
 ### Windows не запускает файл
 

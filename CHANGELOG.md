@@ -2,6 +2,13 @@
 
 Формат близок к [Keep a Changelog](https://keepachangelog.com/ru/1.0.0/), версии - SemVer.
 
+## [0.3.1] - 2026-06-10
+
+### Документация
+
+- Ссылки на скачивание бинарника переведены на постоянный пермалинк `releases/latest/download/goip-bridge` - он всегда ведёт на последний релиз, ссылки больше не нужно править под каждую версию.
+- Устранён разнобой версий в документации (часть страниц ссылалась на старый релиз).
+
 ## [0.3.0] - 2026-06-10
 
 ### Добавлено
@@ -76,6 +83,13 @@
 ---
 
 ## English
+
+## [0.3.1] - 2026-06-10
+
+### Documentation
+
+- Binary download links now use the permanent `releases/latest/download/goip-bridge` permalink, which always points to the newest release, so links no longer need bumping per version.
+- Fixed version drift across the docs (some pages still pointed to an older release).
 
 ## [0.3.0] - 2026-06-10
 

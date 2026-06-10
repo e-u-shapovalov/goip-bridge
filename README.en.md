@@ -13,14 +13,14 @@ Visual schemes and first-run maps: [SCHEMES.md](SCHEMES.md)
 For normal users, no Git and no source build are required.
 
 1. Open GitHub Releases: <https://github.com/e-u-shapovalov/goip-bridge/releases>
-2. Open the latest release, currently **v0.2.0**.
+2. Open the latest release, currently **v0.3.1**.
 3. Download the **`goip-bridge`** file from **Assets**.
 4. Do not download `Source code (zip)` or `Source code (tar.gz)` unless you want to build from source.
 5. Do not use `Code -> Download ZIP` if you only need the ready-to-run program.
 
 Direct Linux x86-64 / amd64 binary:
 
-<https://github.com/e-u-shapovalov/goip-bridge/releases/download/v0.2.0/goip-bridge>
+<https://github.com/e-u-shapovalov/goip-bridge/releases/latest/download/goip-bridge>
 
 Beginner download guide: [DOWNLOAD.md](DOWNLOAD.md)
 
@@ -55,7 +55,7 @@ Use it for lawful messaging only and with recipient consent.
 ```sh
 mkdir -p /opt/goip-bridge
 cd /opt/goip-bridge
-curl -L -o goip-bridge https://github.com/e-u-shapovalov/goip-bridge/releases/download/v0.2.0/goip-bridge
+curl -L -o goip-bridge https://github.com/e-u-shapovalov/goip-bridge/releases/latest/download/goip-bridge
 chmod +x goip-bridge
 ```
 
