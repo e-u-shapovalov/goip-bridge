@@ -149,6 +149,31 @@ sudo systemctl status goip-bridge
 sudo journalctl -u goip-bridge -f
 ```
 
+### Обновление версии
+
+При обновлении меняется только бинарник, `config.json` остаётся на месте. Скачайте новую версию рядом, атомарно подмените и перезапустите сервис:
+
+```sh
+sudo curl -L -o /opt/goip-bridge/goip-bridge.new https://github.com/e-u-shapovalov/goip-bridge/releases/latest/download/goip-bridge
+sudo chmod +x /opt/goip-bridge/goip-bridge.new
+sudo chown goip-bridge:goip-bridge /opt/goip-bridge/goip-bridge.new
+sudo mv /opt/goip-bridge/goip-bridge.new /opt/goip-bridge/goip-bridge
+sudo systemctl restart goip-bridge
+sudo journalctl -u goip-bridge -n 20 --no-pager
+```
+
+После перезапуска первой строкой лога будет баннер с новой версией. Проверить версию без логов:
+
+```sh
+/opt/goip-bridge/goip-bridge -version
+```
+
+Что важно при обновлении:
+
+- `config.json` обратно совместим: новые версии не ломают старый конфиг, новые поля берут значения по умолчанию. Меняйте конфиг только чтобы включить новую возможность - смотрите release notes.
+- Команды установки (`useradd`, `daemon-reload`, `enable`) повторять не нужно - только подмена бинарника и `restart`.
+- Unit-файл обновляйте, только если в release notes указано, что он изменился.
+
 **goip-bridge** - это легкий серверный шлюз для аппаратных GSM-шлюзов **GoIP DBL / Hybertone**. Он подключает GoIP к современному приложению: принимает SMS, отправляет SMS, выполняет USSD-запросы, отдает HTTP API, отправляет webhook и, при необходимости, работает с MySQL-очередью входящих и исходящих сообщений.
 
 Если коротко: вы запускаете один бинарный файл на Linux-сервере, указываете этот сервер в настройках **SMS Server** на GoIP и получаете понятный **GoIP SMS API** для CRM, биллинга, Telegram-бота, мониторинга, helpdesk или своего backend-сервиса.

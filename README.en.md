@@ -151,6 +151,31 @@ sudo systemctl status goip-bridge
 sudo journalctl -u goip-bridge -f
 ```
 
+### Updating the version
+
+On an update only the binary changes; `config.json` stays in place. Download the new version next to the old one, swap it atomically and restart the service:
+
+```sh
+sudo curl -L -o /opt/goip-bridge/goip-bridge.new https://github.com/e-u-shapovalov/goip-bridge/releases/latest/download/goip-bridge
+sudo chmod +x /opt/goip-bridge/goip-bridge.new
+sudo chown goip-bridge:goip-bridge /opt/goip-bridge/goip-bridge.new
+sudo mv /opt/goip-bridge/goip-bridge.new /opt/goip-bridge/goip-bridge
+sudo systemctl restart goip-bridge
+sudo journalctl -u goip-bridge -n 20 --no-pager
+```
+
+After the restart the first log line is the banner with the new version. Check the version without logs:
+
+```sh
+/opt/goip-bridge/goip-bridge -version
+```
+
+What matters on an update:
+
+- `config.json` is backward compatible: new versions do not break the old config, new fields fall back to defaults. Change the config only to enable a new feature - see the release notes.
+- Do not repeat the install commands (`useradd`, `daemon-reload`, `enable`) - only swap the binary and `restart`.
+- Update the unit file only when the release notes say it changed.
+
 **goip-bridge** is a lightweight server-side gateway for **GoIP DBL / Hybertone** GSM devices. It turns the GoIP SMS Server UDP protocol into a practical HTTP API, incoming SMS webhooks, USSD requests and an optional MySQL inbox/outbox queue.
 
 Run one binary on a Linux server, point the GoIP channel's **SMS Server IP/Port** to it, and integrate SMS with your CRM, bot, billing system, monitoring stack or backend service.
