@@ -7,7 +7,7 @@ The commands below target Linux x86-64 / amd64. Switch to root with `sudo -i` or
 Create a directory and download the latest release:
 
 ```sh
-sudo install -d -m 755 /opt/goip-bridge
+sudo mkdir -p /opt/goip-bridge
 cd /opt/goip-bridge
 sudo curl -L -o goip-bridge https://github.com/e-u-shapovalov/goip-bridge/releases/latest/download/goip-bridge
 sudo chmod +x goip-bridge
@@ -19,7 +19,13 @@ Run it once:
 sudo ./goip-bridge
 ```
 
-Choose `ru` or `en`. The bridge creates `config.json` and exits. Fill the config:
+Choose `ru` or `en`. The bridge creates `config.json` and exits.
+
+The screenshot below shows the download and first run: the bridge prints a version banner, asks for the language, creates `config.json` and hints what to fill in.
+
+![goip-bridge first run](docs/screenshots/first-run.png)
+
+Fill the config:
 
 ```sh
 sudo nano config.json
@@ -32,6 +38,10 @@ Start the bridge:
 ```sh
 sudo ./goip-bridge -config config.json
 ```
+
+At startup the bridge prints a version banner and a `config in effect` table - the settings that actually took effect. Secrets (`http_token`, `webhook_token`, `webhook_url`) are shown as `set`, not their value, so the log is safe to share. The last lines are `listening on UDP :44444` and `HTTP API on 127.0.0.1:8080`.
+
+![goip-bridge startup log and config in effect](docs/screenshots/startup-config-in-effect.png)
 
 Open the GoIP SMS settings:
 
@@ -61,13 +71,30 @@ Check locally that the line registered:
 curl -H "Authorization: Bearer CHANGE_ME_TO_LONG_RANDOM_TOKEN" http://127.0.0.1:8080/lines
 ```
 
-Check firewall rules and listening ports:
+Check the firewall and listening ports. Run the command for your distribution - the other firewalls may not be installed, and `command not found` is normal.
+
+Debian (nftables):
 
 ```sh
-sudo nft list ruleset | grep -E '8080|44444'   # nftables
-sudo ufw status verbose                        # ufw
-sudo firewall-cmd --list-ports                 # firewalld
-sudo ss -lntup | grep -E ':(8080|44444)\b'     # who is listening
+sudo nft list ruleset | grep -E '8080|44444'
+```
+
+Ubuntu (ufw):
+
+```sh
+sudo ufw status verbose
+```
+
+RHEL / CentOS / Fedora / Rocky / AlmaLinux (firewalld):
+
+```sh
+sudo firewall-cmd --list-ports
+```
+
+Who is actually listening on the ports (any distribution):
+
+```sh
+sudo ss -lntup | grep -E ':(8080|44444)\b'
 ```
 
 You need UDP `44444` from GoIP to the server. Open TCP `8080` only when the HTTP API must be reached from another machine. Use your firewall/distribution documentation for the exact allow commands.
@@ -91,6 +118,8 @@ curl -X POST http://127.0.0.1:8080/sms \
   -H "Content-Type: application/json" \
   -d '{"line":"Go1","to":"+996700000001","text":"Test message"}'
 ```
+
+The number format depends on the SIM card's operator. The bridge accepts a number with or without `+` (`+996700000001` or `996700000001`) - the check is simple: an optional `+` and 3-20 digits. After that the number is handled by GoIP and the operator network, and their requirements differ: some accept the international format with `+`, some without `+`, and some reject their own country code and expect the local format (for example `0700000001`). If an SMS ends up `failed` or does not arrive, try a different number format for that operator.
 
 Receive the first inbound SMS: send an SMS to the SIM card inside GoIP and check your webhook or the local inbox:
 
