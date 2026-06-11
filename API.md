@@ -115,13 +115,15 @@ Request:
 }
 ```
 
-`line` may be empty. In no-MySQL synchronous mode the bridge then selects the
-alive line with the lowest id. For predictable routing, pass the line explicitly.
+`line` may be empty. In no-MySQL synchronous mode the bridge then picks an
+alive line round-robin (over `default_lines`, or over all alive lines when
+`default_lines` is empty). For predictable routing, pass the line explicitly.
 
 Success:
 
 ```json
 {
+  "id": "1781140000000000-abcdef",
   "line": "Go1",
   "status": "sent",
   "sms_no": "123"
@@ -132,6 +134,7 @@ Device-level failure:
 
 ```json
 {
+  "id": "1781140000000000-abcdef",
   "line": "Go1",
   "status": "failed",
   "error": "timeout"
@@ -140,6 +143,10 @@ Device-level failure:
 
 That failure response uses HTTP `200` because the API request itself was valid.
 Your client must check `status`.
+
+When `webhook_url` is set, the same result is also delivered as a webhook event
+(`sent` or `failed`) with the same `id` — send events fire in every mode, not
+only with MySQL.
 
 ## POST /sms With MySQL
 
@@ -192,6 +199,7 @@ Success:
 
 ```json
 {
+  "id": "1781140000000000-abcdef",
   "line": "Go1",
   "reply": "Balance: 42.00"
 }
@@ -201,13 +209,17 @@ Timeout or device error:
 
 ```json
 {
+  "id": "1781140000000000-abcdef",
   "line": "Go1",
   "error": "ussd timeout"
 }
 ```
 
-If `line` is empty in no-MySQL mode, the bridge selects the alive line with the
-lowest id.
+If `line` is empty in no-MySQL mode, the bridge picks an alive line round-robin
+(over `default_lines`, or over all alive lines when `default_lines` is empty).
+
+When `webhook_url` is set, the same result is also delivered as a webhook event
+(`done` or `failed`) with the same `id`.
 
 ## POST /ussd With MySQL
 
@@ -417,6 +429,12 @@ and, in MySQL mode, become `failed` with `error_code='dlr_state:<state>'`.
 
 ### Queue Events
 
+The `queued` event fires when a message enters the MySQL queue — both for HTTP
+`/sms`|`/ussd` requests and for rows your application INSERTs into the outbox
+table directly. Direct rows are announced when the bridge claims them from the
+queue (a `guid` is assigned at that moment); each `guid` is announced once per
+process run.
+
 `queued`:
 
 ```json
@@ -502,6 +520,53 @@ Failure:
 }
 ```
 
+### Line Monitoring Events
+
+Sent only when `webhook_url` is configured. A background ticker watches every
+registered line.
+
+`line_down` — no keepalive for longer than `line_dead_after_sec`; `line_up` —
+the line recovered:
+
+```json
+{
+  "type": "line_down",
+  "line": "Go1",
+  "dead_after_sec": 120,
+  "channel": {
+    "line": "Go1",
+    "alive": false,
+    "last_seen_ago_sec": 180,
+    "recent_sends": 5,
+    "recent_fail_streak": 0,
+    "suspect": false
+  },
+  "time": "2026-06-11T10:00:00Z"
+}
+```
+
+`line_failing` — `fail_threshold` consecutive send failures on one line (sent
+once per streak); `line_recovered` — a send on that line succeeded again:
+
+```json
+{
+  "type": "line_failing",
+  "line": "Go1",
+  "fail_streak": 10,
+  "threshold": 10,
+  "channel": {
+    "line": "Go1",
+    "alive": true,
+    "last_seen_ago_sec": 2,
+    "recent_sends": 10,
+    "recent_fail_streak": 10,
+    "suspect": true,
+    "suspect_reason": "10 sends in a row failed — possible ban or no balance"
+  },
+  "time": "2026-06-11T10:00:00Z"
+}
+```
+
 ### Webhook Retry
 
 Webhook delivery is reliable within the configured in-memory retry window:
@@ -509,6 +574,11 @@ Webhook delivery is reliable within the configured in-memory retry window:
 - HTTP client timeout: 15 seconds.
 - Success: any HTTP `2xx`.
 - Failure: network error, timeout or non-2xx response.
+- Redirects are NOT followed: a `3xx` answer is a failure (following it would
+  silently turn the POST into a GET and drop the JSON body). Point
+  `webhook_url` at the final, non-redirecting URL.
+- Every delivery logs its HTTP status: `webhook OK 200` / `webhook WARN 301 ...`
+  (green/red on an interactive terminal, plain text in the log files).
 - Retry delay: `base_sec`, then doubled on each failed attempt.
 - Maximum age: `webhook_retry.max_hours`.
 - Queue capacity: 10,000 pending events.

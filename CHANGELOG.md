@@ -4,16 +4,32 @@
 
 ## [Unreleased]
 
-### Запланировано
+## [0.4.0] - 2026-06-12
 
-- Webhook-события мониторинга линий: `line_down` (keepalive не приходил дольше `line_dead_after_sec`), `line_up` (линия восстановилась), `line_failing` (несколько ошибок отправки подряд на одной линии, порог настраивается).
-- Webhook-событие `queued` для строк, добавленных в `goip_outbox` напрямую из приложения (сейчас `queued` шлётся только при постановке через HTTP `/sms` и `/ussd`).
-- Если задан `webhook_url`, события отправки (`sent`, `done`, `failed`) шлются в любом режиме, включая синхронный без MySQL (сейчас - только в MySQL-режиме).
-- Доставка webhook не следует за редиректами и логирует HTTP-статус ответа: `2xx` - успех, `3xx` - явное предупреждение, что `webhook_url` редиректит и тело `POST` теряется (сейчас bridge молча идёт по редиректу, теряет тело и считает доставку успешной).
-- Самопроверка новой версии при старте - опция `check_updates`, по умолчанию выключена. Если выключена, в лог пишется одна строка «проверка обновлений отключена». Если включена и на GitHub есть более новый релиз - выводится заметный блок с номером новой версии; если версия актуальна, блок не выводится. Проверка фоновая, с таймаутом, при недоступности GitHub молча пропускается.
-- Команда самообновления `goip-bridge -update`: скачивает свежий бинарник и `checksums.txt`, сверяет SHA256, сохраняет старый бинарник в `.bak` и атомарно заменяет себя. После успешного обновления `.bak` удаляется, чтобы не захламлять папку; он остаётся только если обновление не удалось - для отката. Перезапуск сервиса под systemd - отдельной командой с правами root.
-- Очистка собственных лог-файлов при старте - опция, по умолчанию включена. `goip-bridge.log`, `goip-bridge.err.log` и `goip-bridge.line-*.log` не копятся рядом с конфигом.
-- Вывод `-version` и стартовый баннер оформляются единой «шапкой» (рамкой) вместо разрозненных строк.
+### Добавлено
+
+- Webhook-мониторинг линий: `line_down` (keepalive не приходил дольше `line_dead_after_sec`), `line_up` (линия восстановилась), `line_failing` (серия ошибок отправки подряд на одной линии, шлётся один раз на серию) и `line_recovered` (после серии отправка снова прошла). Порог серии - новая настройка `fail_threshold` (по умолчанию 10), она же управляет пометкой `suspect` в `/status`.
+- Webhook-событие `queued` теперь шлётся и для строк, добавленных в `goip_outbox` напрямую из приложения: bridge анонсирует строку в момент забора из очереди (тогда же ей присваивается `guid`). Дубль для строк, поставленных через HTTP, исключён - каждый `guid` анонсируется один раз за запуск процесса.
+- Проверка новой версии при старте - настройка `check_updates`, по умолчанию выключена (bridge никуда не «звонит»). Если выключена, в лог пишется одна строка «проверка обновлений отключена». Если включена и на GitHub есть более новый релиз - выводится заметная рамка с номером новой версии; если версия актуальна, не выводится ничего. Проверка фоновая, с таймаутом ~3 секунды, при недоступности GitHub молча пропускается.
+- Команда самообновления `goip-bridge -update`: скачивает свежий бинарник и `checksums.txt` из последнего релиза, сверяет SHA256, сохраняет старый бинарник в `.bak` и атомарно заменяет себя. После успешного обновления `.bak` удаляется, чтобы не захламлять папку; он остаётся только если обновление не удалось - для отката. Перезапуск сервиса под systemd - отдельной командой с правами root; если `-update` запущен от root, перезапуск выполняется автоматически.
+- Очистка собственных лог-файлов при старте - настройка `clear_logs_on_start`, по умолчанию включена. `goip-bridge.log`, `goip-bridge.err.log` и `goip-bridge.line-*.log` не копятся рядом с конфигом: при старте каждый переезжает в одну копию `.prev`. Логи не удаляются - лог прошлого запуска (в том числе упавшего) сохраняется в `.prev`, поэтому краш-луп под systemd не уничтожает улики.
+- Новые настройки `fail_threshold`, `check_updates` и `clear_logs_on_start` добавлены в шаблоны `-init ru|en`, `config.example.jsonc`, таблицу `config in effect` и справочник CONFIG.md.
+
+### Изменено
+
+- Если задан `webhook_url`, события результата отправки (`queued`, `sent`, `done`, `failed`) шлются в любом режиме, включая синхронный без MySQL (раньше - только в MySQL-режиме). Синхронные ответы `/sms` и `/ussd` теперь содержат `id` - тот же идентификатор приходит в webhook-событии.
+- Доставка webhook не следует за редиректами: ответ `3xx` считается ошибкой доставки и ретраится (раньше bridge молча шёл по редиректу, по стандарту терял тело `POST` и считал доставку успешной). HTTP-статус каждой доставки логируется: `webhook OK 200` / `webhook WARN 301 ... Location: ...`; на интерактивном терминале статус подсвечивается зелёным/красным, в файлы логов всегда пишется обычный текст без ANSI-кодов, и строки `OK` не попадают в `.err.log`.
+- Вывод `-version` и стартовый баннер оформлены единой «шапкой»-рамкой (имя и версия, слоган, копирайт, адрес репозитория) вместо трёх разрозненных строк.
+
+### Исправлено
+
+- Задвоенный префикс в сообщении об ошибке занятого UDP-порта: вместо `listen udp :44444: listen udp :44444: bind: address already in use` печатается одна ошибка.
+
+### Документация
+
+- «Быстрый старт» обкатан вживую от и до на чистом сервере; по итогам: `mkdir -p`, скриншоты первого запуска и таблицы `config in effect`, проверка firewall по дистрибутивам (nftables/ufw/firewalld), замечание о форматах номера у разных операторов, пометка что `/inbox` живёт в памяти, разделы «Обновление версии» и «Создание и подключение MySQL» (RU+EN).
+- INSTALL.md получил раздел «Обновление goip-bridge» (`-update` и ручной путь), API.md - события мониторинга линий, `id` в синхронных ответах и политику редиректов, TROUBLESHOOTING.md - диагностику `webhook WARN 301`.
+- Уточнён выбор линии при пустом `line` без MySQL: round-robin по живым линиям (как в очереди), а не «линия с наименьшим id».
 
 ## [0.3.2] - 2026-06-11
 
@@ -135,16 +151,32 @@
 
 ## [Unreleased]
 
-### Planned
+## [0.4.0] - 2026-06-12
 
-- Line-monitoring webhook events: `line_down` (no keepalive for longer than `line_dead_after_sec`), `line_up` (line recovered), `line_failing` (several consecutive send errors on one line, threshold configurable).
-- A `queued` webhook event for rows inserted into `goip_outbox` directly by the application (today `queued` fires only when a job is enqueued via the HTTP `/sms` and `/ussd` endpoints).
-- When `webhook_url` is set, send events (`sent`, `done`, `failed`) are delivered in every mode, including synchronous no-MySQL mode (today only in MySQL mode).
-- Webhook delivery no longer follows redirects and logs the response HTTP status: `2xx` is success, `3xx` is a clear warning that `webhook_url` redirects and the `POST` body is dropped (today the bridge silently follows the redirect, loses the body, and counts the delivery as successful).
-- Startup self-check for a new version - a `check_updates` option, disabled by default. When disabled, the log gets a single line "update check disabled". When enabled and a newer release exists on GitHub, a prominent block with the new version number is printed; when the version is current, no block is printed. The check is background, time-bounded and silently skipped when GitHub is unreachable.
-- A self-update command `goip-bridge -update`: downloads the fresh binary and `checksums.txt`, verifies the SHA256, keeps the old binary as `.bak` and atomically replaces itself. After a successful update the `.bak` is removed to keep the folder clean; it is kept only if the update failed, for rollback. Restarting the service under systemd is a separate root command.
-- Clearing the bridge's own log files on startup - an option, enabled by default. `goip-bridge.log`, `goip-bridge.err.log` and `goip-bridge.line-*.log` no longer pile up next to the config.
-- `-version` output and the startup banner are formatted as a single boxed header instead of loose lines.
+### Added
+
+- Line-monitoring webhook events: `line_down` (no keepalive for longer than `line_dead_after_sec`), `line_up` (line recovered), `line_failing` (a streak of consecutive send errors on one line, sent once per streak) and `line_recovered` (a send succeeded again after a streak). The streak threshold is the new `fail_threshold` setting (default 10), which also drives the `suspect` flag in `/status`.
+- The `queued` webhook event now also fires for rows inserted into `goip_outbox` directly by the application: the bridge announces the row when it claims it from the queue (a `guid` is assigned at that moment). No duplicate for rows enqueued via HTTP - each `guid` is announced once per process run.
+- Startup check for a new version - the `check_updates` setting, disabled by default (the bridge never "phones home"). When disabled, the log gets a single line saying the check is off. When enabled and a newer release exists on GitHub, a prominent box with the new version number is printed; when the version is current, nothing is printed. The check is background, time-bounded (~3 s) and silently skipped when GitHub is unreachable.
+- The self-update command `goip-bridge -update`: downloads the fresh binary and `checksums.txt` from the latest release, verifies the SHA256, keeps the old binary as `.bak` and atomically replaces itself. After a successful update the `.bak` is removed to keep the folder clean; it is kept only if the update failed, for rollback. Restarting the service under systemd stays a separate root command; when `-update` itself runs as root, the restart happens automatically.
+- Clearing the bridge's own log files on startup - the `clear_logs_on_start` setting, enabled by default. `goip-bridge.log`, `goip-bridge.err.log` and `goip-bridge.line-*.log` no longer pile up next to the config: on startup each moves to a single `.prev` copy. Logs are not deleted - the previous run's log (including a crashed one) survives in `.prev`, so a crash loop under systemd cannot destroy the evidence.
+- The new settings `fail_threshold`, `check_updates` and `clear_logs_on_start` are included in the `-init ru|en` templates, `config.example.jsonc`, the `config in effect` table and the CONFIG.md reference.
+
+### Changed
+
+- When `webhook_url` is set, send-result events (`queued`, `sent`, `done`, `failed`) are delivered in every mode, including synchronous no-MySQL mode (previously MySQL mode only). Synchronous `/sms` and `/ussd` responses now carry an `id` - the same identifier arrives in the webhook event.
+- Webhook delivery no longer follows redirects: a `3xx` answer counts as a delivery failure and is retried (previously the bridge silently followed the redirect, which per the standard dropped the `POST` body, and counted the delivery as successful). Every delivery's HTTP status is logged: `webhook OK 200` / `webhook WARN 301 ... Location: ...`; on an interactive terminal the status is colored green/red, log files always get plain text without ANSI codes, and `OK` lines stay out of `.err.log`.
+- `-version` output and the startup banner are formatted as a single boxed header (name and version, tagline, copyright, repository URL) instead of three loose lines.
+
+### Fixed
+
+- Doubled prefix in the busy-UDP-port error message: a single error is printed instead of `listen udp :44444: listen udp :44444: bind: address already in use`.
+
+### Documentation
+
+- The quick start was walked end-to-end on a clean server; resulting fixes: `mkdir -p`, screenshots of the first run and the `config in effect` table, firewall checks per distribution (nftables/ufw/firewalld), a note on per-operator phone number formats, a note that `/inbox` lives in memory, and the "Updating the version" and "Creating and connecting MySQL" sections (RU+EN).
+- INSTALL.md gained an update section (`-update` and the manual path), API.md - the line-monitoring events, the `id` in synchronous responses and the redirect policy, TROUBLESHOOTING.md - the `webhook WARN 301` diagnostics.
+- Line selection with an empty `line` and no MySQL is now documented correctly: round-robin over alive lines (same as the queue), not "the line with the lowest id".
 
 ## [0.3.2] - 2026-06-11
 

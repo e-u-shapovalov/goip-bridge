@@ -108,7 +108,7 @@ curl -X POST http://127.0.0.1:8080/ussd \
   -d '{"line":"Go1","code":"*100#"}'
 ```
 
-Without MySQL, the reply is returned directly by curl. In MySQL mode, the result also arrives as a webhook event with `type:"done"` when `webhook_url` is set.
+The reply is returned directly by curl. When `webhook_url` is set, the result is also duplicated as a webhook event with `type:"done"` in every mode - both without MySQL and with the queue; in MySQL mode it is preceded by `type:"queued"`.
 
 Send the first SMS:
 
@@ -153,7 +153,18 @@ sudo journalctl -u goip-bridge -f
 
 ### Updating the version
 
-On an update only the binary changes; `config.json` stays in place. Download the new version next to the old one, swap it atomically and restart the service:
+On an update only the binary changes; `config.json` stays in place.
+
+The shortest path is the built-in self-update. The command downloads the latest release and `checksums.txt`, verifies the SHA256, backs the current binary up to `.bak`, swaps the binary atomically and deletes the `.bak` on success (the `.bak` is kept only when the update failed - for rollback):
+
+```sh
+sudo -u goip-bridge /opt/goip-bridge/goip-bridge -update
+sudo systemctl restart goip-bridge
+```
+
+When `-update` is run as root, the systemd service restart happens automatically.
+
+The manual way - download the new version next to the old one, swap it atomically and restart the service:
 
 ```sh
 sudo curl -L -o /opt/goip-bridge/goip-bridge.new https://github.com/e-u-shapovalov/goip-bridge/releases/latest/download/goip-bridge
@@ -163,6 +174,8 @@ sudo mv /opt/goip-bridge/goip-bridge.new /opt/goip-bridge/goip-bridge
 sudo systemctl restart goip-bridge
 sudo journalctl -u goip-bridge -n 20 --no-pager
 ```
+
+You can also learn about new versions automatically: enable `"check_updates": true` in `config.json` - on startup the bridge asks GitHub in the background and, when a newer release exists, prints a prominent box with its number. The check is off by default (the bridge never "phones home"), and the log says so in one line.
 
 After the restart the first log line is the banner with the new version. Check the version without logs:
 
@@ -252,7 +265,7 @@ Visual schemes and first-run maps: [SCHEMES.md](SCHEMES.md)
 For normal users, no Git and no source build are required.
 
 1. Open GitHub Releases: <https://github.com/e-u-shapovalov/goip-bridge/releases>
-2. Open the latest release, currently **v0.3.2**.
+2. Open the latest release, currently **v0.4.0**.
 3. Download the **`goip-bridge`** file from **Assets**.
 4. Do not download `Source code (zip)` or `Source code (tar.gz)` unless you want to build from source.
 5. Do not use `Code -> Download ZIP` if you only need the ready-to-run program.
@@ -270,8 +283,19 @@ Beginner download guide: [DOWNLOAD.md](DOWNLOAD.md)
 - Receives inbound SMS from GoIP.
 - Keeps the latest 500 inbound messages in memory via `GET /inbox`.
 - Sends inbound SMS and DLR events to an outgoing webhook.
+- Sends send-result webhook events (`queued`, `sent`, `done`, `failed`) in
+  every mode - with the MySQL queue and without it.
+- Monitors lines via webhook: `line_down`/`line_up` when keepalive disappears
+  and recovers, `line_failing`/`line_recovered` on a streak of send failures
+  (threshold `fail_threshold`).
 - Retries webhook delivery in memory with exponential backoff and writes
-  undelivered events to `goip-bridge.fallback.jsonl`.
+  undelivered events to `goip-bridge.fallback.jsonl`. Redirects are not
+  followed (3xx = delivery failure) and every delivery's HTTP status is logged.
+- Self-updates with one command: `goip-bridge -update` (SHA256-verified, with a
+  `.bak` rollback on failure) plus an optional startup version check
+  (`check_updates`, off by default).
+- Keeps the log folder clean: on startup the previous run's logs are moved to
+  one `.prev` copy each (`clear_logs_on_start`, on by default).
 - Sends SMS via `POST /sms`.
 - Runs USSD commands via `POST /ussd`.
 - Tracks asynchronous queue jobs via `GET /status/{id}`.
@@ -353,9 +377,9 @@ Firewall note: the GoIP device must be able to reach UDP port `44444` on the bri
 
 For synchronous `/sms`, do not rely on HTTP `200` alone. Device-level send
 failures are returned as JSON with `status: "failed"` and an `error` field. If
-`line` is empty without MySQL, the bridge picks the alive line with the lowest
-id. In MySQL queue mode, empty `line` is routed round-robin through
-`default_lines` or all alive lines.
+`line` is empty, the bridge picks an alive line round-robin — through
+`default_lines` or all alive lines — in both the synchronous and the MySQL
+queue mode.
 
 ## HTTP API
 

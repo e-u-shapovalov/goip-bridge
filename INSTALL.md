@@ -262,6 +262,8 @@ Content-Type: application/json
 }
 ```
 
+Кроме `sms` и `dlr` на тот же URL приходят события результатов отправки (`queued`, `sent`, `done`, `failed` - в любом режиме, с MySQL и без) и события мониторинга линий (`line_down`, `line_up`, `line_failing`, `line_recovered`). Полный список с примерами: [API.md](API.md). Важно: `webhook_url` должен отвечать `2xx` без редиректов - редирект bridge не выполняет и считает доставку неуспешной (подробности в [TROUBLESHOOTING.md](TROUBLESHOOTING.md)).
+
 ## Вариант 2: запуск с MySQL
 
 MySQL-режим нужен, если ваше приложение хочет:
@@ -468,6 +470,38 @@ Loaded: loaded (/etc/systemd/system/goip-bridge.service; enabled)
 Active: active (running)
 Main PID: ... (goip-bridge)
 ```
+
+## Обновление goip-bridge
+
+При обновлении меняется только бинарник: `config.json`, база и unit-файл остаются на месте. Новые поля конфига берут значения по умолчанию, поэтому старый конфиг продолжает работать.
+
+Встроенное самообновление - одна команда. Bridge скачает последний релиз и `checksums.txt`, сверит SHA256, сохранит текущий бинарник в `.bak`, атомарно подменит файл и удалит `.bak` при успехе (при сбое `.bak` остаётся для отката):
+
+```sh
+sudo -u goip-bridge /opt/goip-bridge/goip-bridge -update
+sudo systemctl restart goip-bridge
+```
+
+Перезапуск сервиса - отдельный root-шаг: системный пользователь `goip-bridge` не имеет права на `systemctl restart`. Если запустить `-update` от root, перезапуск выполнится автоматически.
+
+Ручной способ без `-update`:
+
+```sh
+sudo curl -L -o /opt/goip-bridge/goip-bridge.new https://github.com/e-u-shapovalov/goip-bridge/releases/latest/download/goip-bridge
+sudo chmod +x /opt/goip-bridge/goip-bridge.new
+sudo chown goip-bridge:goip-bridge /opt/goip-bridge/goip-bridge.new
+sudo mv /opt/goip-bridge/goip-bridge.new /opt/goip-bridge/goip-bridge
+sudo systemctl restart goip-bridge
+```
+
+Проверка после перезапуска - первой в логе идёт рамка с новой версией:
+
+```sh
+sudo journalctl -u goip-bridge -n 20 --no-pager
+/opt/goip-bridge/goip-bridge -version
+```
+
+Чтобы узнавать о новых версиях автоматически, включите в `config.json` `"check_updates": true` - при старте bridge фоново спросит GitHub и напечатает рамку, если вышла новая версия. По умолчанию проверка выключена.
 
 ## Firewall
 

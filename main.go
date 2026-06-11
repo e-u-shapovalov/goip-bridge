@@ -15,8 +15,10 @@ import (
 	"bytes"
 	"context"
 	crand "crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -27,9 +29,11 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -43,21 +47,42 @@ import (
 
 // Build/identity metadata. appVersion can be overridden at build time:
 //
-//	go build -ldflags "-X main.appVersion=0.3.2" .
+//	go build -ldflags "-X main.appVersion=0.4.0" .
 const (
 	appName      = "goip-bridge"
 	appTagline   = "GoIP SMS/USSD gateway"
 	appRepoURL   = "https://github.com/e-u-shapovalov/goip-bridge"
+	latestAPIURL = "https://api.github.com/repos/e-u-shapovalov/goip-bridge/releases/latest"
+	latestAsset  = "https://github.com/e-u-shapovalov/goip-bridge/releases/latest/download/"
 	appCopyright = "(c) Evgenii Shapovalov 2026"
 )
 
-var appVersion = "0.3.2"
+var appVersion = "0.4.0"
 
-// printBanner writes the two-line identity header (repo URL + copyright/version) shown as the first
-// thing at startup and next to the first-run config prompt.
+// printBanner writes the boxed identity header shown by -version, at startup, and next to the
+// first-run config prompt.
 func printBanner(w io.Writer) {
-	fmt.Fprintln(w, appRepoURL)
-	fmt.Fprintf(w, "%s v%s\n", appCopyright, appVersion)
+	printBox(w, []string{
+		fmt.Sprintf("%s v%s", appName, appVersion),
+		appTagline,
+		appCopyright,
+		appRepoURL,
+	})
+}
+
+func printBox(w io.Writer, lines []string) {
+	width := 0
+	for _, line := range lines {
+		if len(line) > width {
+			width = len(line)
+		}
+	}
+	border := "+" + strings.Repeat("-", width+2) + "+"
+	fmt.Fprintln(w, border)
+	for _, line := range lines {
+		fmt.Fprintf(w, "| %-*s |\n", width, line)
+	}
+	fmt.Fprintln(w, border)
 }
 
 // ----------------------------------------------------------------------------
@@ -98,17 +123,20 @@ type WebhookRetry struct {
 }
 
 type Config struct {
-	ListenUDP      string            `json:"listen_udp"`    // device-facing, e.g. "172.16.172.3:44444"
-	ListenHTTP     string            `json:"listen_http"`   // API, e.g. "127.0.0.1:8080"
-	HTTPToken      string            `json:"http_token"`    // Bearer token for the API ("" = open)
-	WebhookURL     string            `json:"webhook_url"`   // optional POST of inbound SMS, DLR and queue result events ("" = off)
-	WebhookToken   string            `json:"webhook_token"` // sent as Bearer to the webhook
+	ListenUDP      string            `json:"listen_udp"`     // device-facing, e.g. "172.16.172.3:44444"
+	ListenHTTP     string            `json:"listen_http"`    // API, e.g. "127.0.0.1:8080"
+	HTTPToken      string            `json:"http_token"`     // Bearer token for the API ("" = open)
+	WebhookURL     string            `json:"webhook_url"`    // optional POST of inbound SMS, DLR and queue result events ("" = off)
+	WebhookToken   string            `json:"webhook_token"`  // sent as Bearer to the webhook
+	FailThreshold  int               `json:"fail_threshold"` // consecutive send failures that emit line_failing (default 10)
+	CheckUpdates   bool              `json:"check_updates"`  // optional startup check for a newer GitHub release (default false)
 	SendTimeout    int               `json:"send_timeout_sec"`
 	USSDTimeout    int               `json:"ussd_timeout_sec"`
 	USSDRetransmit int               `json:"ussd_retransmit_sec"`
 	Debug          bool              `json:"debug"`               // detailed SMS/USSD/inbound logging to file
 	DebugLine      bool              `json:"debug_line"`          // per-line raw keepalive log (incl. password) to goip-bridge.line-<id>.log, each capped at 3 MB
 	LogMaxMB       int               `json:"log_max_mb"`          // per-file log cap in MB (default 10)
+	ClearLogsStart *bool             `json:"clear_logs_on_start"` // archive current bridge logs to .prev on startup (default true)
 	LineDeadSec    int               `json:"line_dead_after_sec"` // line treated as dead after this many seconds without keepalive (default 120)
 	AllowSrc       []string          `json:"allow_src"`           // optional CIDR/IP allow-list for device UDP packets (empty = accept all; firewall is then the only barrier)
 	DB             *DBConfig         `json:"db"`                  // optional MySQL integration (absent = off)
@@ -185,6 +213,13 @@ func loadConfig(path string) (*Config, error) {
 	}
 	if c.LineDeadSec <= 0 {
 		c.LineDeadSec = 120
+	}
+	if c.FailThreshold <= 0 {
+		c.FailThreshold = defaultFailThreshold
+	}
+	if c.ClearLogsStart == nil {
+		v := true
+		c.ClearLogsStart = &v
 	}
 	if c.DB != nil {
 		if c.DB.Host == "" {
@@ -450,11 +485,13 @@ type Inbound struct {
 // ----------------------------------------------------------------------------
 
 type Server struct {
-	cfg  *Config
-	conn *net.UDPConn
-	dbp  atomic.Pointer[sql.DB] // nil until/unless MySQL is connected
-	srv  *http.Server
-	elog *log.Logger // errors -> goip-bridge.err.log (+ main + stderr)
+	cfg   *Config
+	conn  *net.UDPConn
+	dbp   atomic.Pointer[sql.DB] // nil until/unless MySQL is connected
+	srv   *http.Server
+	elog  *log.Logger // errors -> goip-bridge.err.log (+ main + stderr)
+	fmain *log.Logger // file-only main log (no stderr) for lines that get colored stderr separately
+	ferr  *log.Logger // file-only main+err log (no stderr), same purpose for WARN lines
 
 	mu    sync.RWMutex
 	lines map[string]*Line
@@ -488,9 +525,14 @@ type Server struct {
 	lineNextSend map[string]time.Time // earliest moment this line may send again (pacing)
 	rrIdx        int                  // round-robin cursor for outbox rows with line=NULL
 	lineSends    map[string][]sendRec // per-line ring of recent send outcomes (channel health)
+	lineFailing  map[string]bool      // line_failing already emitted until the next success
 
-	whMu    sync.Mutex      // guards whQueue
-	whQueue []*webhookEvent // reliable webhook delivery queue (in RAM, retried with backoff)
+	whMu             sync.Mutex           // guards whQueue/queuedAnnounced
+	whQueue          []*webhookEvent      // reliable webhook delivery queue (in RAM, retried with backoff)
+	queuedAnnounced  map[string]time.Time // in-process dedup for queued webhook events by guid
+	lineStateMu      sync.Mutex
+	lineAlivePrev    map[string]bool // previous lineAlive snapshot for line_down/line_up events
+	coloredStatusTTY bool            // stderr is a TTY; status lines may use ANSI there only
 }
 
 // sendRec is one recent send outcome for a line (channel-health ring).
@@ -528,10 +570,18 @@ func newServer(cfg *Config) *Server {
 		seq:          uint64(time.Now().Unix()),
 		elog:         log.New(os.Stderr, "", log.LstdFlags), // replaced in main once log files are open
 		webhookSem:   make(chan struct{}, 16),
-		httpClient:   &http.Client{Timeout: 15 * time.Second},
 		lineBusy:     map[string]bool{},
 		lineNextSend: map[string]time.Time{},
 		lineSends:    map[string][]sendRec{},
+		lineFailing:  map[string]bool{},
+		httpClient: &http.Client{
+			Timeout: 15 * time.Second,
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
+		queuedAnnounced: map[string]time.Time{},
+		lineAlivePrev:   map[string]bool{},
 	}
 }
 
@@ -578,7 +628,11 @@ func (s *Server) allowedSrc(addr *net.UDPAddr) bool {
 
 // lineAlive reports whether a line is usable: GSM-registered AND seen via keepalive recently.
 func (s *Server) lineAlive(ln *Line) bool {
-	return ln.Alive && time.Since(ln.LastSeen) < time.Duration(s.cfg.LineDeadSec)*time.Second
+	return s.lineAliveAt(ln, time.Now())
+}
+
+func (s *Server) lineAliveAt(ln *Line, now time.Time) bool {
+	return ln.Alive && now.Sub(ln.LastSeen) < time.Duration(s.cfg.LineDeadSec)*time.Second
 }
 
 // lineCount returns how many lines have ever registered (an upper bound on sends per poll).
@@ -1290,18 +1344,50 @@ func (s *Server) newGUID() string {
 	return fmt.Sprintf("%d-%x", time.Now().UnixMicro(), b[:])
 }
 
-const lineSendsCap = 20      // recent outcomes kept per line
-const suspectFailStreak = 10 // consecutive failures that flag a channel as suspect
+const lineSendsCap = 20         // recent outcomes kept per line
+const defaultFailThreshold = 10 // consecutive failures that flag a channel as suspect / line_failing
 
 // recordSend appends a send outcome to a line's channel-health ring.
 func (s *Server) recordSend(line string, ok bool) {
+	if strings.TrimSpace(line) == "" {
+		return
+	}
+	var event map[string]any
 	s.paceMu.Lock()
 	r := append(s.lineSends[line], sendRec{ok: ok, at: time.Now()})
 	if len(r) > lineSendsCap {
 		r = r[len(r)-lineSendsCap:]
 	}
 	s.lineSends[line] = r
+	streak := 0
+	for i := len(r) - 1; i >= 0; i-- {
+		if r[i].ok {
+			break
+		}
+		streak++
+	}
+	threshold := s.failThreshold()
+	if ok {
+		if s.lineFailing[line] {
+			delete(s.lineFailing, line)
+			event = map[string]any{"type": "line_recovered", "line": line, "fail_streak": 0, "threshold": threshold, "time": time.Now()}
+		}
+	} else if threshold > 0 && streak >= threshold && !s.lineFailing[line] {
+		s.lineFailing[line] = true
+		event = map[string]any{"type": "line_failing", "line": line, "fail_streak": streak, "threshold": threshold, "time": time.Now()}
+	}
 	s.paceMu.Unlock()
+	if event != nil {
+		event["channel"] = s.channelHealth(line)
+		s.fireWebhook(event)
+	}
+}
+
+func (s *Server) failThreshold() int {
+	if s == nil || s.cfg == nil || s.cfg.FailThreshold <= 0 {
+		return defaultFailThreshold
+	}
+	return s.cfg.FailThreshold
 }
 
 // channelHealth summarizes a line's state for webhook/status payloads: alive, how long
@@ -1330,11 +1416,82 @@ func (s *Server) channelHealth(line string) map[string]any {
 		"line": line, "alive": alive, "last_seen_ago_sec": lastSeenAgo,
 		"recent_sends": total, "recent_fail_streak": streak, "suspect": false,
 	}
-	if streak >= suspectFailStreak {
+	if streak >= s.failThreshold() {
 		h["suspect"] = true
 		h["suspect_reason"] = fmt.Sprintf("%d sends in a row failed — possible ban or no balance", streak)
 	}
 	return h
+}
+
+func (s *Server) lineMonitor(ctx context.Context) {
+	if s.cfg.WebhookURL == "" {
+		return
+	}
+	interval := time.Duration(s.cfg.LineDeadSec/4) * time.Second
+	if interval < time.Second {
+		interval = time.Second
+	}
+	if interval > 30*time.Second {
+		interval = 30 * time.Second
+	}
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-t.C:
+			s.checkLineTransitions(now)
+		}
+	}
+}
+
+func (s *Server) checkLineTransitions(now time.Time) {
+	type lineState struct {
+		id    string
+		alive bool
+	}
+	s.mu.RLock()
+	states := make([]lineState, 0, len(s.lines))
+	for id, ln := range s.lines {
+		states = append(states, lineState{id: id, alive: s.lineAliveAt(ln, now)})
+	}
+	s.mu.RUnlock()
+	if len(states) == 0 {
+		return
+	}
+	sort.Slice(states, func(i, j int) bool { return states[i].id < states[j].id })
+
+	var events []map[string]any
+	s.lineStateMu.Lock()
+	for _, st := range states {
+		prev, known := s.lineAlivePrev[st.id]
+		if !known {
+			s.lineAlivePrev[st.id] = st.alive
+			continue
+		}
+		if prev == st.alive {
+			continue
+		}
+		s.lineAlivePrev[st.id] = st.alive
+		typ := "line_down"
+		if st.alive {
+			typ = "line_up"
+		}
+		events = append(events, map[string]any{
+			"type":           typ,
+			"line":           st.id,
+			"dead_after_sec": s.cfg.LineDeadSec,
+			"time":           now,
+		})
+	}
+	s.lineStateMu.Unlock()
+	for _, ev := range events {
+		if line, _ := ev["line"].(string); line != "" {
+			ev["channel"] = s.channelHealth(line)
+		}
+		s.fireWebhook(ev)
+	}
 }
 
 type outboxJob struct {
@@ -1440,6 +1597,13 @@ func (s *Server) outboxLoop(ctx context.Context) {
 					s.releaseLine(target) // another worker / a cancel took the row — no pacing penalty
 					continue
 				}
+				extra := map[string]any{}
+				if typ == "ussd" {
+					extra["code"] = j.to
+				} else {
+					extra["to"] = j.to
+				}
+				s.fireQueued(guid, typ, target, extra)
 				go s.processSend(j.id, guid, typ, target, j.to, j.text.String)
 				dispatched++
 			}
@@ -1488,15 +1652,16 @@ func (s *Server) processSend(id int64, guid, typ, lineID, to, text string) {
 		if err != nil {
 			s.execRetry("UPDATE "+ot+" SET status='failed', error_code=?, line=?, sent_at=NOW() WHERE id=?",
 				err.Error(), ln.ID, id)
+			s.recordSend(lineID, false)
 			s.fireWebhook(map[string]any{"type": "failed", "id": guid, "msg_type": "ussd", "line": ln.ID,
 				"error": err.Error(), "channel": s.channelHealth(ln.ID), "time": time.Now()})
 		} else {
 			s.execRetry("UPDATE "+ot+" SET status='done', reply=?, error_code=NULL, line=?, sent_at=NOW() WHERE id=?",
 				reply, ln.ID, id)
+			s.recordSend(lineID, true)
 			s.fireWebhook(map[string]any{"type": "done", "id": guid, "msg_type": "ussd", "line": ln.ID,
 				"reply": reply, "channel": s.channelHealth(ln.ID), "time": time.Now()})
 		}
-		s.recordSend(lineID, err == nil)
 		s.finishLine(lineID)
 		return
 	}
@@ -1509,15 +1674,16 @@ func (s *Server) processSend(id int64, guid, typ, lineID, to, text string) {
 		}
 		s.execRetry("UPDATE "+ot+" SET status='sent', sms_no=?, line=?, error_code=NULL, sent_at=NOW() WHERE id=?",
 			smsNoVal, ln.ID, id)
+		s.recordSend(lineID, true)
 		s.fireWebhook(map[string]any{"type": "sent", "id": guid, "msg_type": "sms", "line": ln.ID,
 			"sms_no": smsNo, "channel": s.channelHealth(ln.ID), "time": time.Now()})
 	} else {
 		s.execRetry("UPDATE "+ot+" SET status='failed', error_code=?, line=?, sent_at=NOW() WHERE id=?",
 			detail, ln.ID, id)
+		s.recordSend(lineID, false)
 		s.fireWebhook(map[string]any{"type": "failed", "id": guid, "msg_type": "sms", "line": ln.ID,
 			"error": detail, "channel": s.channelHealth(ln.ID), "time": time.Now()})
 	}
-	s.recordSend(lineID, ok)
 	s.finishLine(lineID) // arm pacing delay after a real send attempt
 }
 
@@ -1701,14 +1867,21 @@ func (s *Server) hSMS(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 404, map[string]string{"error": "no alive line"})
 		return
 	}
+	guid := s.newGUID()
 	ok, smsNo, detail := s.sendSMS(ln, req.To, req.Text)
-	resp := map[string]any{"line": ln.ID}
+	resp := map[string]any{"id": guid, "line": ln.ID}
 	if ok {
+		s.recordSend(ln.ID, true)
 		resp["status"] = "sent"
 		resp["sms_no"] = smsNo
+		s.fireWebhook(map[string]any{"type": "sent", "id": guid, "msg_type": "sms", "line": ln.ID,
+			"sms_no": smsNo, "channel": s.channelHealth(ln.ID), "time": time.Now()})
 	} else {
+		s.recordSend(ln.ID, false)
 		resp["status"] = "failed"
 		resp["error"] = detail
+		s.fireWebhook(map[string]any{"type": "failed", "id": guid, "msg_type": "sms", "line": ln.ID,
+			"error": detail, "channel": s.channelHealth(ln.ID), "time": time.Now()})
 	}
 	writeJSON(w, 200, resp) // HTTP 200 always; check "status" in the body
 }
@@ -1780,12 +1953,19 @@ func (s *Server) hUSSD(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 404, map[string]string{"error": "no alive line"})
 		return
 	}
+	guid := s.newGUID()
 	reply, err := s.sendUSSD(ln, req.Code)
 	if err != nil {
-		writeJSON(w, 500, map[string]string{"error": err.Error(), "line": ln.ID})
+		s.recordSend(ln.ID, false)
+		s.fireWebhook(map[string]any{"type": "failed", "id": guid, "msg_type": "ussd", "line": ln.ID,
+			"error": err.Error(), "channel": s.channelHealth(ln.ID), "time": time.Now()})
+		writeJSON(w, 500, map[string]string{"id": guid, "error": err.Error(), "line": ln.ID})
 		return
 	}
-	writeJSON(w, 200, map[string]string{"reply": reply, "line": ln.ID})
+	s.recordSend(ln.ID, true)
+	s.fireWebhook(map[string]any{"type": "done", "id": guid, "msg_type": "ussd", "line": ln.ID,
+		"reply": reply, "channel": s.channelHealth(ln.ID), "time": time.Now()})
+	writeJSON(w, 200, map[string]string{"id": guid, "reply": reply, "line": ln.ID})
 }
 
 // hStatus reports a message's state by guid: status, fields, queue position (while queued,
@@ -1960,6 +2140,9 @@ func (s *Server) pickLine(id string) *Line {
 
 // fireQueued emits the "queued" webhook event (with channel health when a line is known).
 func (s *Server) fireQueued(guid, msgType, line string, extra map[string]any) {
+	if !s.markQueuedAnnounced(guid) {
+		return
+	}
 	ev := map[string]any{"type": "queued", "id": guid, "msg_type": msgType, "line": line, "time": time.Now()}
 	for k, v := range extra {
 		ev[k] = v
@@ -1968,6 +2151,32 @@ func (s *Server) fireQueued(guid, msgType, line string, extra map[string]any) {
 		ev["channel"] = s.channelHealth(line)
 	}
 	s.fireWebhook(ev)
+}
+
+func (s *Server) markQueuedAnnounced(guid string) bool {
+	guid = strings.TrimSpace(guid)
+	if guid == "" {
+		return true
+	}
+	now := time.Now()
+	s.whMu.Lock()
+	defer s.whMu.Unlock()
+	if _, ok := s.queuedAnnounced[guid]; ok {
+		return false
+	}
+	if len(s.queuedAnnounced) > webhookQueueCap {
+		cutoff := now.Add(-24 * time.Hour)
+		for id, at := range s.queuedAnnounced {
+			if at.Before(cutoff) {
+				delete(s.queuedAnnounced, id)
+			}
+		}
+		if len(s.queuedAnnounced) > webhookQueueCap {
+			s.queuedAnnounced = map[string]time.Time{}
+		}
+	}
+	s.queuedAnnounced[guid] = now
+	return true
 }
 
 const webhookQueueCap = 10000 // max pending webhook events held in RAM
@@ -2119,7 +2328,247 @@ func (s *Server) postWebhook(body []byte) bool {
 	}
 	io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
+	s.logWebhookStatus(resp.StatusCode, resp.Header.Get("Location"))
 	return resp.StatusCode >= 200 && resp.StatusCode < 300
+}
+
+var stderrLog = log.New(os.Stderr, "", log.LstdFlags)
+
+func (s *Server) logWebhookStatus(status int, location string) {
+	ok := status >= 200 && status < 300
+	msg := fmt.Sprintf("webhook OK %d", status)
+	if !ok {
+		msg = fmt.Sprintf("webhook WARN %d", status)
+		if status >= 300 && status < 400 {
+			msg = fmt.Sprintf("webhook WARN %d: expected 200, got %d — webhook_url redirects, the POST body is dropped, fix the URL", status, status)
+			if location != "" {
+				msg += ", Location: " + location
+			}
+		}
+	}
+	// Files get plain text only (never ANSI); OK lines stay out of .err.log.
+	if ok {
+		if s.fmain != nil {
+			s.fmain.Print(msg)
+		}
+	} else if s.ferr != nil {
+		s.ferr.Print(msg)
+	}
+	out := msg
+	if s.coloredStatusTTY { // color goes to the live terminal only
+		color := "\x1b[31m"
+		if ok {
+			color = "\x1b[32m"
+		}
+		out = color + msg + "\x1b[0m"
+	}
+	stderrLog.Print(out)
+}
+
+func startUpdateCheck(ctx context.Context, enabled bool) {
+	if !enabled {
+		log.Printf("проверка обновлений отключена (check_updates=false)")
+		return
+	}
+	go func() {
+		latest, err := fetchLatestVersion(ctx)
+		if err != nil || latest == "" {
+			return
+		}
+		if compareVersions(latest, appVersion) > 0 {
+			printBox(log.Writer(), []string{
+				"New goip-bridge release available",
+				fmt.Sprintf("installed: v%s", trimVersionPrefix(appVersion)),
+				fmt.Sprintf("latest:    v%s", trimVersionPrefix(latest)),
+				appRepoURL + "/releases/latest",
+			})
+		}
+	}()
+}
+
+func fetchLatestVersion(parent context.Context) (string, error) {
+	ctx, cancel := context.WithTimeout(parent, 2500*time.Millisecond)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, "GET", latestAPIURL, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("User-Agent", appName+"/"+appVersion)
+	resp, err := (&http.Client{Timeout: 3 * time.Second}).Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		io.Copy(io.Discard, resp.Body)
+		return "", fmt.Errorf("github status %d", resp.StatusCode)
+	}
+	var v struct {
+		TagName string `json:"tag_name"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&v); err != nil {
+		return "", err
+	}
+	return v.TagName, nil
+}
+
+func trimVersionPrefix(v string) string {
+	return strings.TrimPrefix(strings.TrimSpace(v), "v")
+}
+
+func compareVersions(a, b string) int {
+	aa := versionParts(a)
+	bb := versionParts(b)
+	for i := 0; i < 3; i++ {
+		if aa[i] > bb[i] {
+			return 1
+		}
+		if aa[i] < bb[i] {
+			return -1
+		}
+	}
+	return 0
+}
+
+func versionParts(v string) [3]int {
+	v = trimVersionPrefix(v)
+	if i := strings.IndexAny(v, "-+"); i >= 0 {
+		v = v[:i]
+	}
+	var out [3]int
+	for i, p := range strings.Split(v, ".") {
+		if i >= len(out) {
+			break
+		}
+		n, _ := strconv.Atoi(p)
+		out[i] = n
+	}
+	return out
+}
+
+func runSelfUpdate() error {
+	if runtime.GOOS != "linux" || runtime.GOARCH != "amd64" {
+		return fmt.Errorf("-update supports the published linux/amd64 binary only (current: %s/%s)", runtime.GOOS, runtime.GOARCH)
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	if realExe, err := filepath.EvalSymlinks(exe); err == nil {
+		exe = realExe
+	}
+	info, err := os.Stat(exe)
+	if err != nil {
+		return err
+	}
+	client := &http.Client{Timeout: 30 * time.Second}
+	checksums, err := downloadBytes(client, latestAsset+"checksums.txt", 1<<20)
+	if err != nil {
+		return fmt.Errorf("download checksums: %w", err)
+	}
+	want, err := checksumFor(checksums, appName)
+	if err != nil {
+		return err
+	}
+	bin, err := downloadBytes(client, latestAsset+appName, 128<<20)
+	if err != nil {
+		return fmt.Errorf("download binary: %w", err)
+	}
+	sum := sha256.Sum256(bin)
+	got := hex.EncodeToString(sum[:])
+	if !strings.EqualFold(got, want) {
+		return fmt.Errorf("checksum mismatch for %s: got %s want %s", appName, got, want)
+	}
+
+	tmp := exe + ".new"
+	bak := exe + ".bak"
+	if err := os.WriteFile(tmp, bin, info.Mode().Perm()); err != nil {
+		return fmt.Errorf("write %s: %w", tmp, err)
+	}
+	if err := os.Chmod(tmp, info.Mode().Perm()); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("chmod %s: %w", tmp, err)
+	}
+	if err := copyFile(exe, bak, info.Mode().Perm()); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("backup %s: %w", bak, err)
+	}
+	if err := os.Rename(tmp, exe); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("replace %s: %w (backup left at %s)", exe, err, bak)
+	}
+	if err := os.Remove(bak); err != nil {
+		return fmt.Errorf("updated, but could not remove backup %s: %w", bak, err)
+	}
+	fmt.Printf("updated %s from GitHub latest release\n", exe)
+	if os.Geteuid() == 0 {
+		if err := exec.Command("systemctl", "restart", appName).Run(); err != nil {
+			return fmt.Errorf("updated, but systemctl restart %s failed: %w", appName, err)
+		}
+		fmt.Printf("systemd service %s restarted\n", appName)
+	} else {
+		fmt.Printf("restart under systemd separately as root: systemctl restart %s\n", appName)
+	}
+	return nil
+}
+
+func downloadBytes(client *http.Client, url string, limit int64) ([]byte, error) {
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", appName+"/"+appVersion)
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		io.Copy(io.Discard, resp.Body)
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	return io.ReadAll(io.LimitReader(resp.Body, limit))
+}
+
+func checksumFor(checksums []byte, name string) (string, error) {
+	sc := bufio.NewScanner(bytes.NewReader(checksums))
+	for sc.Scan() {
+		f := strings.Fields(sc.Text())
+		if len(f) >= 2 && f[1] == name {
+			if len(f[0]) != sha256.Size*2 {
+				return "", fmt.Errorf("bad checksum length for %s", name)
+			}
+			if _, err := hex.DecodeString(f[0]); err != nil {
+				return "", fmt.Errorf("bad checksum for %s: %w", name, err)
+			}
+			return f[0], nil
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return "", err
+	}
+	return "", fmt.Errorf("checksum for %s not found", name)
+}
+
+func copyFile(src, dst string, perm os.FileMode) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, perm)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		return err
+	}
+	if err := out.Close(); err != nil {
+		return err
+	}
+	return os.Chmod(dst, perm)
 }
 
 func atoi(s string) int { n, _ := strconv.Atoi(strings.TrimSpace(s)); return n }
@@ -2192,13 +2641,52 @@ func setupLogging(s *Server, cfgPath string) {
 	dir := filepath.Dir(cfgPath)
 	s.logDir = dir
 	s.fbPath = filepath.Join(dir, "goip-bridge.fallback.jsonl")
+	if configBoolDefault(s.cfg.ClearLogsStart, true) {
+		preservePreviousLogs(dir)
+	}
 	max := int64(s.cfg.LogMaxMB) * 1024 * 1024
 	mainCW := newCappedWriter(filepath.Join(dir, "goip-bridge.log"), max)
 	errCW := newCappedWriter(filepath.Join(dir, "goip-bridge.err.log"), max)
 	log.SetOutput(io.MultiWriter(os.Stderr, mainCW))
+	s.fmain = log.New(mainCW, "", log.LstdFlags)
+	s.ferr = log.New(io.MultiWriter(mainCW, errCW), "", log.LstdFlags)
 	s.elog = log.New(io.MultiWriter(os.Stderr, mainCW, errCW), "", log.LstdFlags)
+	s.coloredStatusTTY = stderrIsTTY()
 	printBanner(io.MultiWriter(os.Stderr, mainCW)) // identity header (no timestamp) to screen + log file
-	log.Printf("logging to %s (goip-bridge.log + .err.log, cap %d MB, debug=%v debug_line=%v)", dir, s.cfg.LogMaxMB, s.cfg.Debug, s.cfg.DebugLine)
+	log.Printf("logging to %s (goip-bridge.log + .err.log, cap %d MB, debug=%v debug_line=%v clear_logs_on_start=%v)", dir, s.cfg.LogMaxMB, s.cfg.Debug, s.cfg.DebugLine, configBoolDefault(s.cfg.ClearLogsStart, true))
+}
+
+func configBoolDefault(v *bool, def bool) bool {
+	if v == nil {
+		return def
+	}
+	return *v
+}
+
+func stderrIsTTY() bool {
+	fi, err := os.Stderr.Stat()
+	return err == nil && fi.Mode()&os.ModeCharDevice != 0
+}
+
+func preservePreviousLogs(dir string) {
+	paths := []string{
+		filepath.Join(dir, "goip-bridge.log"),
+		filepath.Join(dir, "goip-bridge.err.log"),
+	}
+	if lineLogs, err := filepath.Glob(filepath.Join(dir, "goip-bridge.line-*.log")); err == nil {
+		paths = append(paths, lineLogs...)
+	}
+	for _, path := range paths {
+		st, err := os.Stat(path)
+		if err != nil || st.IsDir() {
+			continue
+		}
+		prev := path + ".prev"
+		_ = os.Remove(prev)
+		if err := os.Rename(path, prev); err != nil {
+			fmt.Fprintf(os.Stderr, "WARN: cannot preserve previous log %s: %v\n", path, err)
+		}
+	}
 }
 
 // logEffectiveConfig prints the settings the daemon is actually running with (after
@@ -2230,6 +2718,8 @@ func (s *Server) logEffectiveConfig() {
 	row("webhook_url", mask(c.WebhookURL), "POST target for inbound SMS + send results (empty = off)")
 	row("webhook_token", mask(c.WebhookToken), "Bearer sent to the webhook")
 	row("webhook_retry", fmt.Sprintf("max %dh, base %ds", c.WebhookRetry.MaxHours, c.WebhookRetry.BaseSec), "reliable webhook backoff window")
+	row("fail_threshold", fmt.Sprintf("%d", c.FailThreshold), "consecutive send failures before line_failing")
+	row("check_updates", fmt.Sprintf("%v", c.CheckUpdates), "startup GitHub release check")
 	row("send_timeout", fmt.Sprintf("%ds", c.SendTimeout), "give up an SMS send after this")
 	row("ussd_timeout", fmt.Sprintf("%ds", c.USSDTimeout), "give up a USSD session after this")
 	row("ussd_retransmit", fmt.Sprintf("%ds", c.USSDRetransmit), "re-send USSD if no reply within this")
@@ -2243,6 +2733,7 @@ func (s *Server) logEffectiveConfig() {
 	row("debug", fmt.Sprintf("%v", c.Debug), "verbose SMS/USSD/inbound logging")
 	row("debug_line", fmt.Sprintf("%v", c.DebugLine), "per-line raw keepalive logs (incl. password)")
 	row("log_max_mb", fmt.Sprintf("%d", c.LogMaxMB), "per-file log cap (MB)")
+	row("clear_logs", fmt.Sprintf("%v", configBoolDefault(c.ClearLogsStart, true)), "archive active bridge logs to .prev on startup")
 	if c.DB != nil {
 		row("db", fmt.Sprintf("%s:%d/%s", c.DB.Host, c.DB.Port, c.DB.Name),
 			fmt.Sprintf("MySQL queue: inbox=%s outbox=%s poll=%ds (connecting...)", c.DB.InboxTable, c.DB.OutboxTable, c.DB.PollSec))
@@ -2289,11 +2780,18 @@ func (s *Server) lineLog(id string) *cappedWriter {
 func main() {
 	cfgPath := flag.String("config", "config.json", "path to config file")
 	showVersion := flag.Bool("version", false, "print version and exit")
+	doUpdate := flag.Bool("update", false, "download and install the latest release, then exit")
 	initLang := flag.String("init", "", "create an annotated config at -config path and exit (value: ru or en)")
 	flag.Parse()
 	if *showVersion {
 		printBanner(os.Stdout)
-		fmt.Printf("%s — %s\n", appName, appTagline)
+		return
+	}
+	if *doUpdate {
+		printBanner(os.Stdout)
+		if err := runSelfUpdate(); err != nil {
+			log.Fatalf("update: %v", err)
+		}
 		return
 	}
 
@@ -2340,7 +2838,7 @@ func main() {
 	}
 	conn, err := net.ListenUDP("udp", udpAddr)
 	if err != nil {
-		log.Fatalf("listen udp %s: %v", cfg.ListenUDP, err)
+		log.Fatalf("%v", err)
 	}
 	// Bind the HTTP listener here (not inside the goroutine): a bind failure is then reported in main
 	// with normal exit, instead of a log.Fatalf inside httpLoop that would os.Exit and skip cleanup.
@@ -2354,6 +2852,7 @@ func main() {
 	s.conn = conn
 	setupLogging(s, *cfgPath)
 	s.logEffectiveConfig()
+	startUpdateCheck(ctx, cfg.CheckUpdates)
 
 	if weakHTTPToken(cfg.HTTPToken) && !isLoopbackAddr(cfg.ListenHTTP) {
 		log.Printf("WARNING: http_token is empty, a placeholder, or too short and the API listens on %s (non-loopback) — the send API is effectively OPEN to the network", cfg.ListenHTTP)
@@ -2383,6 +2882,7 @@ func main() {
 	go s.httpLoop(ctx, httpLn)
 	go s.udpLoop(ctx)
 	go s.webhookWorker(ctx)
+	go s.lineMonitor(ctx)
 
 	<-ctx.Done()
 	log.Printf("shutting down...")
@@ -2512,8 +3012,14 @@ const configTemplateRU = `{
   // ──────────────────────────────────────────────────────────────
 
   // URL, куда bridge шлёт события {"type":"sms",...}, {"type":"dlr",...},
-  // {"type":"queued",...}, {"type":"sent",...}, {"type":"failed",...}
-  // и {"type":"done",...}. Пусто = вебхук выключен.
+  // {"type":"queued",...}, {"type":"sent",...}, {"type":"failed",...},
+  // {"type":"done",...} и события мониторинга линий: {"type":"line_down"}
+  // (нет keepalive дольше line_dead_after_sec), {"type":"line_up"}
+  // (линия восстановилась), {"type":"line_failing"} (fail_threshold ошибок
+  // отправки подряд), {"type":"line_recovered"} (после line_failing отправка
+  // снова прошла). Пусто = вебхук выключен. Если url задан, события отправки
+  // шлются в ЛЮБОМ режиме — и с MySQL-очередью, и в синхронном без БД.
+  // Редиректы НЕ выполняются: ответ 3xx считается ошибкой доставки (см. лог).
   "webhook_url": "",
 
   // Bearer-токен, который BRIDGE предъявляет ВАШЕМУ серверу (в заголовке
@@ -2524,6 +3030,11 @@ const configTemplateRU = `{
   // паузой (base_sec, дальше ×2: 5,10,20,40…), пока приёмник не ответит 2xx,
   // максимум max_hours. По умолчанию (если блока нет): 3ч / 5с.
   "webhook_retry": { "max_hours": 3, "base_sec": 5 },
+
+  // Сколько ошибок отправки ПОДРЯД на одной линии считать проблемой канала:
+  // на webhook_url уходит {"type":"line_failing"}, в /status линия помечается
+  // suspect. Сбрасывается первой успешной отправкой. По умолчанию 10.
+  "fail_threshold": 10,
 
   // ──────────────────────────────────────────────────────────────
   //  БЛОК 4 · ТАЙМАУТЫ ОТПРАВКИ              (bridge ↔ GoIP, секунды)
@@ -2583,6 +3094,17 @@ const configTemplateRU = `{
   // Через сколько секунд без keepalive линия считается «мёртвой» (alive=false)
   // и пропускается при отправке. По умолчанию 120.
   "line_dead_after_sec": 120,
+
+  // true (по умолчанию) = при старте текущие логи bridge (goip-bridge.log,
+  // .err.log, line-*.log) переезжают в одну копию .prev каждый — папка не
+  // зарастает, а лог прошлого запуска (в т.ч. упавшего) сохраняется.
+  "clear_logs_on_start": true,
+
+  // true = при старте фоново спросить GitHub, не вышла ли новая версия
+  // (один GET к api.github.com, до ~3с, при недоступности молча пропускается).
+  // По умолчанию false — bridge никуда не «звонит».
+  // Обновиться до свежего релиза: ./goip-bridge -update
+  "check_updates": false,
 
   // ──────────────────────────────────────────────────────────────
   //  БЛОК 6 · MySQL (опционально) — очередь outbox + входящие inbox
@@ -2713,8 +3235,14 @@ const configTemplateEN = `{
   // ──────────────────────────────────────────────────────────────
 
   // URL the bridge sends {"type":"sms",...}, {"type":"dlr",...},
-  // {"type":"queued",...}, {"type":"sent",...}, {"type":"failed",...}
-  // and {"type":"done",...} to. Empty = webhook off.
+  // {"type":"queued",...}, {"type":"sent",...}, {"type":"failed",...},
+  // {"type":"done",...} and line-monitoring events to: {"type":"line_down"}
+  // (no keepalive for longer than line_dead_after_sec), {"type":"line_up"}
+  // (line recovered), {"type":"line_failing"} (fail_threshold consecutive
+  // send failures), {"type":"line_recovered"} (a send succeeded again after
+  // line_failing). Empty = webhook off. When the url is set, send events fire
+  // in EVERY mode — both with the MySQL queue and in the synchronous no-DB mode.
+  // Redirects are NOT followed: a 3xx response counts as a delivery failure (see log).
   "webhook_url": "",
 
   // Bearer token the BRIDGE presents to YOUR server (Authorization header)
@@ -2725,6 +3253,11 @@ const configTemplateEN = `{
   // backoff (base_sec, then doubling: 5,10,20,40…) until the receiver returns 2xx,
   // up to max_hours. Defaults (if the block is absent): 3h / 5s.
   "webhook_retry": { "max_hours": 3, "base_sec": 5 },
+
+  // How many CONSECUTIVE send failures on one line count as a channel problem:
+  // {"type":"line_failing"} is sent to webhook_url and the line is flagged
+  // suspect in /status. Reset by the first successful send. Default 10.
+  "fail_threshold": 10,
 
   // ──────────────────────────────────────────────────────────────
   //  BLOCK 4 · SEND TIMEOUTS                 (bridge ↔ GoIP, seconds)
@@ -2783,6 +3316,17 @@ const configTemplateEN = `{
   // A line is "dead" after this many seconds without keepalive (alive=false)
   // and is skipped when sending. Default 120.
   "line_dead_after_sec": 120,
+
+  // true (default) = on startup the current bridge logs (goip-bridge.log,
+  // .err.log, line-*.log) are moved to a single .prev copy each — the folder
+  // stays clean while the previous run's log (incl. a crashed one) is kept.
+  "clear_logs_on_start": true,
+
+  // true = on startup ask GitHub in the background whether a newer release
+  // exists (one GET to api.github.com, up to ~3s, silently skipped when
+  // unreachable). Default false — the bridge never "phones home".
+  // To update to the latest release: ./goip-bridge -update
+  "check_updates": false,
 
   // ──────────────────────────────────────────────────────────────
   //  BLOCK 6 · MySQL (optional) — outbox queue + inbox table
