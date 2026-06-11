@@ -127,6 +127,8 @@ Receive the first inbound SMS: send an SMS to the SIM card inside GoIP and check
 curl -H "Authorization: Bearer CHANGE_ME_TO_LONG_RANDOM_TOKEN" http://127.0.0.1:8080/inbox
 ```
 
+`/inbox` shows the latest 500 inbound SMS from the current process memory, not from a database. This list is cleared when the bridge restarts. For persistent storage, enable MySQL - then inbound SMS are written to the `goip_inbox` table and survive a restart.
+
 Congratulations, the minimal setup is done.
 
 ### Run as a systemd service
