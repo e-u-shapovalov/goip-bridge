@@ -4,6 +4,12 @@
 
 ## [Unreleased]
 
+### Запланировано
+
+- Webhook-события мониторинга линий: `line_down` (keepalive не приходил дольше `line_dead_after_sec`), `line_up` (линия восстановилась), `line_failing` (несколько ошибок отправки подряд на одной линии, порог настраивается).
+- Webhook-событие `queued` для строк, добавленных в `goip_outbox` напрямую из приложения (сейчас `queued` шлётся только при постановке через HTTP `/sms` и `/ussd`).
+- Если задан `webhook_url`, события отправки (`sent`, `done`, `failed`) шлются в любом режиме, включая синхронный без MySQL (сейчас - только в MySQL-режиме).
+
 ## [0.3.2] - 2026-06-11
 
 ### Добавлено
@@ -123,6 +129,12 @@
 ## English
 
 ## [Unreleased]
+
+### Planned
+
+- Line-monitoring webhook events: `line_down` (no keepalive for longer than `line_dead_after_sec`), `line_up` (line recovered), `line_failing` (several consecutive send errors on one line, threshold configurable).
+- A `queued` webhook event for rows inserted into `goip_outbox` directly by the application (today `queued` fires only when a job is enqueued via the HTTP `/sms` and `/ussd` endpoints).
+- When `webhook_url` is set, send events (`sent`, `done`, `failed`) are delivered in every mode, including synchronous no-MySQL mode (today only in MySQL mode).
 
 ## [0.3.2] - 2026-06-11
 
