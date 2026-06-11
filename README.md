@@ -39,6 +39,10 @@ sudo nano config.json
 sudo ./goip-bridge -config config.json
 ```
 
+При старте bridge печатает баннер с версией и таблицу `config in effect` - какие настройки реально применились. Секреты (`http_token`, `webhook_token`, `webhook_url`) показываются как `set`, а не значением, поэтому лог можно показывать. В конце - строки `listening on UDP :44444` и `HTTP API on 127.0.0.1:8080`.
+
+![Лог старта goip-bridge и таблица config in effect](docs/screenshots/startup-config-in-effect.png)
+
 Откройте настройки SMS в GoIP:
 
 ```text
