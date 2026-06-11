@@ -11,7 +11,7 @@
 - Если задан `webhook_url`, события отправки (`sent`, `done`, `failed`) шлются в любом режиме, включая синхронный без MySQL (сейчас - только в MySQL-режиме).
 - Доставка webhook не следует за редиректами и логирует HTTP-статус ответа: `2xx` - успех, `3xx` - явное предупреждение, что `webhook_url` редиректит и тело `POST` теряется (сейчас bridge молча идёт по редиректу, теряет тело и считает доставку успешной).
 - Самопроверка новой версии при старте - опция `check_updates`, по умолчанию выключена. Если выключена, в лог пишется одна строка «проверка обновлений отключена». Если включена и на GitHub есть более новый релиз - выводится заметный блок с номером новой версии; если версия актуальна, блок не выводится. Проверка фоновая, с таймаутом, при недоступности GitHub молча пропускается.
-- Команда самообновления `goip-bridge -update`: скачивает свежий бинарник и `checksums.txt`, сверяет SHA256, сохраняет старый бинарник в `.bak` и атомарно заменяет себя. Перезапуск сервиса под systemd - отдельной командой с правами root.
+- Команда самообновления `goip-bridge -update`: скачивает свежий бинарник и `checksums.txt`, сверяет SHA256, сохраняет старый бинарник в `.bak` и атомарно заменяет себя. После успешного обновления `.bak` удаляется, чтобы не захламлять папку; он остаётся только если обновление не удалось - для отката. Перезапуск сервиса под systemd - отдельной командой с правами root.
 - Очистка собственных лог-файлов при старте - опция, по умолчанию включена. `goip-bridge.log`, `goip-bridge.err.log` и `goip-bridge.line-*.log` не копятся рядом с конфигом.
 - Вывод `-version` и стартовый баннер оформляются единой «шапкой» (рамкой) вместо разрозненных строк.
 
@@ -142,7 +142,7 @@
 - When `webhook_url` is set, send events (`sent`, `done`, `failed`) are delivered in every mode, including synchronous no-MySQL mode (today only in MySQL mode).
 - Webhook delivery no longer follows redirects and logs the response HTTP status: `2xx` is success, `3xx` is a clear warning that `webhook_url` redirects and the `POST` body is dropped (today the bridge silently follows the redirect, loses the body, and counts the delivery as successful).
 - Startup self-check for a new version - a `check_updates` option, disabled by default. When disabled, the log gets a single line "update check disabled". When enabled and a newer release exists on GitHub, a prominent block with the new version number is printed; when the version is current, no block is printed. The check is background, time-bounded and silently skipped when GitHub is unreachable.
-- A self-update command `goip-bridge -update`: downloads the fresh binary and `checksums.txt`, verifies the SHA256, keeps the old binary as `.bak` and atomically replaces itself. Restarting the service under systemd is a separate root command.
+- A self-update command `goip-bridge -update`: downloads the fresh binary and `checksums.txt`, verifies the SHA256, keeps the old binary as `.bak` and atomically replaces itself. After a successful update the `.bak` is removed to keep the folder clean; it is kept only if the update failed, for rollback. Restarting the service under systemd is a separate root command.
 - Clearing the bridge's own log files on startup - an option, enabled by default. `goip-bridge.log`, `goip-bridge.err.log` and `goip-bridge.line-*.log` no longer pile up next to the config.
 - `-version` output and the startup banner are formatted as a single boxed header instead of loose lines.
 
