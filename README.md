@@ -19,7 +19,13 @@ sudo chmod +x goip-bridge
 sudo ./goip-bridge
 ```
 
-Выберите язык `ru` или `en`. Bridge сам создаст `config.json` и выйдет. Заполните конфиг:
+Выберите язык `ru` или `en`. Bridge сам создаст `config.json` и выйдет.
+
+Так выглядит скачивание и первый запуск: bridge выводит баннер с версией, спрашивает язык, создаёт `config.json` и подсказывает, что заполнить.
+
+![Первый запуск goip-bridge](docs/screenshots/first-run.png)
+
+Заполните конфиг:
 
 ```sh
 sudo nano config.json
