@@ -519,6 +519,26 @@ curl -H "Authorization: Bearer CHANGE_ME_TO_LONG_RANDOM_TOKEN" http://127.0.0.1:
 
 Полное описание API: [API.md](API.md)
 
+## Webhook-события
+
+Правило простое: **если `webhook_url` задан - события шлются всегда**, в любом режиме, с MySQL и без. Пустой `webhook_url` = вебхук выключен.
+
+| Событие | Когда приходит |
+|---|---|
+| `sms` | входящая SMS с линии |
+| `dlr` | отчёт о доставке от GoIP |
+| `queued` | сообщение попало в очередь - и через HTTP, и при прямом `INSERT` в `goip_outbox` |
+| `sent` / `failed` | результат отправки SMS |
+| `done` / `failed` | результат USSD - ответ оператора в поле `reply` |
+| `line_down` / `line_up` | линия пропала / восстановилась (по keepalive, порог `line_dead_after_sec`) |
+| `line_failing` / `line_recovered` | `fail_threshold` ошибок отправки подряд / снова успех |
+
+У USSD нет «входящих»: это всегда запрос-ответ. Запрос уходит через `/ussd` или `INSERT` с `type='ussd'`, ответ оператора приходит событием `done` (в MySQL-режиме - ещё и в колонку `reply`).
+
+События `line_down`/`line_up` шлются на переходах состояния: при старте bridge запоминает текущее состояние линий молча, поэтому рестарт не присылает пачку ложных `line_up`.
+
+Каждая доставка видна в логе строкой `webhook OK 200`. Редиректы не выполняются: `webhook WARN 301` в логе означает, что `webhook_url` редиректит и его надо поправить - см. [TROUBLESHOOTING.md](TROUBLESHOOTING.md). Формат всех событий с примерами JSON: [API.md](API.md).
+
 ## MySQL-режим
 
 MySQL не обязателен. Если блок `db` отсутствует в `config.json`, `goip-bridge` работает только через HTTP API, webhook и память.

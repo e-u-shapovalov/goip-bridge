@@ -409,6 +409,26 @@ use `GET /status/{id}`, webhook events or SQL to see the final result.
 
 Full API reference: [API.md](API.md)
 
+## Webhook Events
+
+The rule is simple: **if `webhook_url` is set - events are always sent**, in every mode, with MySQL and without it. An empty `webhook_url` = webhook off.
+
+| Event | When it arrives |
+|---|---|
+| `sms` | inbound SMS from a line |
+| `dlr` | delivery report from GoIP |
+| `queued` | a message entered the queue - both via HTTP and via a direct `INSERT` into `goip_outbox` |
+| `sent` / `failed` | SMS send result |
+| `done` / `failed` | USSD result - the operator's answer in the `reply` field |
+| `line_down` / `line_up` | a line disappeared / recovered (by keepalive, threshold `line_dead_after_sec`) |
+| `line_failing` / `line_recovered` | `fail_threshold` consecutive send failures / success again |
+
+USSD has no "inbound" direction: it is always request-response. The request goes via `/ussd` or an `INSERT` with `type='ussd'`, the operator's answer arrives as a `done` event (in MySQL mode also in the `reply` column).
+
+`line_down`/`line_up` fire on state transitions: on startup the bridge memorizes the current line states silently, so a restart does not send a burst of false `line_up` events.
+
+Every delivery is visible in the log as `webhook OK 200`. Redirects are not followed: `webhook WARN 301` in the log means `webhook_url` redirects and must be fixed - see [TROUBLESHOOTING.md](TROUBLESHOOTING.md). The format of all events with JSON examples: [API.md](API.md).
+
 ## MySQL Mode
 
 MySQL is optional. If the `db` section is absent from `config.json`, the bridge works with HTTP API, webhooks and in-memory inbox only.
