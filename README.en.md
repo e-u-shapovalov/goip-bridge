@@ -176,6 +176,63 @@ What matters on an update:
 - Do not repeat the install commands (`useradd`, `daemon-reload`, `enable`) - only swap the binary and `restart`.
 - Update the unit file only when the release notes say it changed.
 
+### Creating and connecting MySQL
+
+Without MySQL the bridge works through the HTTP API and webhooks. MySQL is needed if your app wants an outbound SMS queue in a table and persistent storage of inbound SMS.
+
+The ready binary does not include the schema file - download it from the repository:
+
+```sh
+cd /opt/goip-bridge
+sudo curl -L -o mysql.schema.sql https://raw.githubusercontent.com/e-u-shapovalov/goip-bridge/main/mysql.schema.sql
+```
+
+Create the database, user and tables:
+
+```sh
+sudo mysql < mysql.schema.sql
+```
+
+This creates the `goip_go` database, the `goip_bridge@127.0.0.1` user and the `goip_inbox` and `goip_outbox` tables.
+
+The schema gives the user a placeholder password `CHANGE_ME_STRONG_DB_PASSWORD`. Replace it with your own:
+
+```sql
+ALTER USER 'goip_bridge'@'127.0.0.1' IDENTIFIED BY 'STRONG_PASSWORD';
+FLUSH PRIVILEGES;
+```
+
+Add the `db` block to `config.json` (if the config was created with `-init`, uncomment the ready block) and use the same password:
+
+```json
+"db": {
+  "host": "127.0.0.1",
+  "port": 3306,
+  "user": "goip_bridge",
+  "password": "STRONG_PASSWORD",
+  "name": "goip_go",
+  "inbox_table": "goip_inbox",
+  "outbox_table": "goip_outbox",
+  "poll_sec": 3
+}
+```
+
+Restart the service:
+
+```sh
+sudo systemctl restart goip-bridge
+```
+
+Check that the database connected - the log shows a line like `db: connected to goip_bridge@127.0.0.1:3306/goip_go — inbox table ... + outbox queue ... active`:
+
+```sh
+sudo journalctl -u goip-bridge -n 20 --no-pager
+```
+
+If instead you see `db: configured but NOT connected ... retrying in background`, check the password, the user's privileges and that MySQL is reachable. While the database is down, `/sms` and `/ussd` in queue mode return `503`. More: [MYSQL.md](MYSQL.md) and [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
+
+Full table schema, user privileges and `INSERT` examples: [MYSQL.md](MYSQL.md).
+
 **goip-bridge** is a lightweight server-side gateway for **GoIP DBL / Hybertone** GSM devices. It turns the GoIP SMS Server UDP protocol into a practical HTTP API, incoming SMS webhooks, USSD requests and an optional MySQL inbox/outbox queue.
 
 Run one binary on a Linux server, point the GoIP channel's **SMS Server IP/Port** to it, and integrate SMS with your CRM, bot, billing system, monitoring stack or backend service.
