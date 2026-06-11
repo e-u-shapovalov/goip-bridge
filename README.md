@@ -226,7 +226,7 @@ flowchart TD
 
 ![GoIP SMS Server settings](docs/screenshots/goip-sms-server-settings.png)
 
-На скриншоте верхняя информация устройства скрыта, а рабочие поля оставлены: `SMS Server`, `SMS Server IP`, `SMS Server Port`, `SMS Client ID`, `Password`, `Save Changes`.
+Рабочие поля на странице: `SMS Server`, `SMS Server IP`, `SMS Server Port`, `SMS Client ID`, `Password`, `Save Changes`. Укажите IP своего Linux-сервера с goip-bridge и порт `44444`.
 
 Скриншоты, которые полезно добавить в будущем:
 
