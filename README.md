@@ -71,13 +71,30 @@ Password: пароль для этого канала
 curl -H "Authorization: Bearer CHANGE_ME_TO_LONG_RANDOM_TOKEN" http://127.0.0.1:8080/lines
 ```
 
-Проверьте firewall и поднятые порты:
+Проверьте firewall и поднятые порты. Выполняйте команду своего дистрибутива - у остальных firewall может быть не установлен, и `command not found` это нормально.
+
+Debian (nftables):
 
 ```sh
-sudo nft list ruleset | grep -E '8080|44444'   # nftables
-sudo ufw status verbose                        # ufw
-sudo firewall-cmd --list-ports                 # firewalld
-sudo ss -lntup | grep -E ':(8080|44444)\b'     # кто слушает порты
+sudo nft list ruleset | grep -E '8080|44444'
+```
+
+Ubuntu (ufw):
+
+```sh
+sudo ufw status verbose
+```
+
+RHEL / CentOS / Fedora / Rocky / AlmaLinux (firewalld):
+
+```sh
+sudo firewall-cmd --list-ports
+```
+
+Кто реально слушает порты (любой дистрибутив):
+
+```sh
+sudo ss -lntup | grep -E ':(8080|44444)\b'
 ```
 
 Открывать нужно UDP `44444` от GoIP к серверу. TCP `8080` открывайте только если HTTP API нужен с другой машины. Как разрешить порты именно в вашем firewall, смотрите в документации своего firewall/дистрибутива.
