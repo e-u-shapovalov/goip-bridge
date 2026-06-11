@@ -51,6 +51,20 @@ chmod +x goip-bridge
 
 ### 3. Создайте `config.json`
 
+Самый простой способ:
+
+```sh
+./goip-bridge -config config.json -init ru
+```
+
+Команда создаёт подробный JSONC-конфиг с русскими комментариями и не перезаписывает существующий файл. Если нужны английские комментарии:
+
+```sh
+./goip-bridge -config config.json -init en
+```
+
+Минимальный вариант можно создать вручную:
+
 ```sh
 nano config.json
 ```
@@ -84,6 +98,8 @@ nano config.json
 ```
 
 Ключ `Go1` должен совпадать с `SMS Client ID` в GoIP и с `id` из `GET /lines`.
+
+Полное объяснение каждой настройки: [CONFIG.md](CONFIG.md)
 
 ### 4. Запустите вручную
 
@@ -252,7 +268,7 @@ MySQL-режим нужен, если ваше приложение хочет:
 
 - читать входящие SMS из таблицы;
 - класть исходящие SMS в очередь;
-- видеть статусы `queued`, `sending`, `sent`, `delivered`, `failed`.
+- видеть статусы `queued`, `sending`, `sent`, `delivered`, `done`, `failed`, `cancelled`.
 
 ### Быстрый SQL под копипаст
 
@@ -289,7 +305,8 @@ outbox table:  goip_outbox
 - `line` - линия GoIP или `NULL` для любой живой линии;
 - `to_number` - номер получателя;
 - `text` - текст SMS;
-- `status` - `queued`, `sending`, `sent`, `delivered`, `failed`;
+- `type` - `sms` или `ussd`;
+- `status` - `queued`, `sending`, `sent`, `delivered`, `done`, `failed`, `cancelled`;
 - `sms_no` - номер SMS от GoIP;
 - `error_code` - ошибка при `failed`;
 - `created_at`, `sent_at`, `delivered_at` - времена этапов.
@@ -312,25 +329,26 @@ outbox table:  goip_outbox
     "name": "goip_go",
     "inbox_table": "goip_inbox",
     "outbox_table": "goip_outbox",
-    "poll_sec": 2
+    "poll_sec": 3
   }
 }
 ```
 
-Если в логе появилось `WARNING: MySQL connect failed, retrying in background`, bridge продолжит работать без MySQL и будет повторять подключение каждые 15 секунд в фоне. Исправьте доступ к базе - переподключение и разбор очереди произойдут автоматически, перезапуск не обязателен. Данные, которые не удалось записать пока база лежала, сохраняются в `goip-bridge.fallback.jsonl` рядом с конфигом.
+Если в логе появилось `db: configured but NOT connected ... — retrying in background; /sms and /ussd return 503 until connected`, bridge будет повторять подключение каждые 15 секунд в фоне. Пока база недоступна, `/sms` и `/ussd` в режиме очереди возвращают `503`, чтобы не отправить сообщение мимо MySQL. `/lines`, `/health` и приём UDP от GoIP продолжают работать. Исправьте доступ к базе - переподключение и разбор очереди произойдут автоматически, перезапуск не обязателен. Данные, которые не удалось записать после нескольких попыток, сохраняются в `goip-bridge.fallback.jsonl` рядом с конфигом.
 
 Runtime-ограничения текущей версии:
 
 - максимум 8 открытых DB-соединений;
-- максимум 8 параллельных отправок SMS из очереди;
-- bridge забирает до 100 строк `queued` за один poll;
+- одно активное SMS/USSD-задание на одну линию;
+- задержка между заданиями на линии управляется `send_pacing`;
+- bridge читает очередь страницами по 100 строк и может пройти до 20 страниц за poll, чтобы строки для мёртвых линий не блокировали остальные;
 - при DLR bridge до 6 раз пытается найти соответствующую строку `sent`, пауза между попытками 1.5 секунды.
 
 ### Пример отправки SMS через MySQL
 
 ```sql
-INSERT INTO goip_outbox (line, to_number, text, status)
-VALUES ('Go1', '996700000001', 'Test from MySQL queue', 'queued');
+INSERT INTO goip_outbox (type, line, to_number, text, status)
+VALUES ('sms', 'Go1', '996700000001', 'Test from MySQL queue', 'queued');
 ```
 
 Проверить статус:
@@ -496,7 +514,8 @@ MySQL/MariaDB порт `3306` обычно не нужно открывать н
 ```sh
 git clone https://github.com/e-u-shapovalov/goip-bridge.git
 cd goip-bridge
-cp config.no-mysql.example.json config.json
+go run . -config config.json -init ru   # создаст config.json с комментариями (или -init en)
+# отредактируйте config.json, затем запустите:
 go run . -config config.json
 ```
 

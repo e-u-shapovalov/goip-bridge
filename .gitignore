@@ -4,7 +4,7 @@
 *.test
 *.out
 
-# Local runtime config and data (ship config.example.json instead)
+# Local runtime config and data (ship config.example.jsonc instead)
 /config.json
 *.db
 
@@ -12,3 +12,7 @@
 *.log
 *.log.1
 goip-bridge.fallback.jsonl
+
+# Release artifacts (attached to GitHub Releases, not committed)
+/goip-bridge-*.tar.gz
+/checksums.txt

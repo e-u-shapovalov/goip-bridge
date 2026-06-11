@@ -15,6 +15,8 @@ flowchart LR
     bridge -->|GET /lines| api[HTTP API 127.0.0.1:8080]
     bridge -->|POST /sms| api
     bridge -->|POST /ussd| api
+    bridge -->|GET /status/{id}| api
+    bridge -->|DELETE /message/{id}| api
     bridge -->|GET /inbox| api
 
     api --> app[CRM / bot / backend]
@@ -125,7 +127,7 @@ sequenceDiagram
     participant GSM as GSM-сеть
 
     App->>Bridge: POST /sms {line,to,text}
-    Bridge->>Bridge: выбрать указанную line или одну живую без гарантии порядка
+    Bridge->>Bridge: выбрать указанную line или минимальный живой id без MySQL
     Bridge->>GoIP: UDP MSG
     GoIP-->>Bridge: PASSWORD
     Bridge->>GoIP: PASSWORD <pass>
@@ -169,6 +171,8 @@ stateDiagram-v2
     sent --> delivered: DLR state=0
     sending --> failed: timeout / error
     sent --> failed: DLR state != 0
+    sending --> done: USSD reply
+    queued --> cancelled: DELETE /message/{id}
 ```
 
 SQL для первой проверки:
@@ -251,11 +255,12 @@ DOWNLOAD.md                что скачать на GitHub
 INSTALL.md                 установка по шагам
 SCHEMES.md                 схемы для понимания
 API.md                     HTTP API
+CONFIG.md                  все настройки config.json
 MYSQL.md                   база, пользователь, таблицы, очередь
 mysql.schema.sql           готовая SQL-схема
 FIREWALL.md                firewall, nftables, ufw, маршруты
 TROUBLESHOOTING.md         диагностика
 goip-bridge.service        systemd unit
-config.example.json        пример с MySQL
-config.no-mysql.example.json пример без MySQL
+config.example.jsonc       пример со всеми опциями (db закомментирован)
+config.no-mysql.example.json минимальный пример без MySQL
 ```

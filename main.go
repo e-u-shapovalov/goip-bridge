@@ -11,8 +11,10 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	crand "crypto/rand"
 	"crypto/subtle"
 	"database/sql"
 	"encoding/json"
@@ -21,6 +23,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net"
 	"net/http"
 	"os"
@@ -35,18 +38,27 @@ import (
 	"syscall"
 	"time"
 
-	_ "github.com/go-sql-driver/mysql"
+	"github.com/go-sql-driver/mysql"
 )
 
 // Build/identity metadata. appVersion can be overridden at build time:
-//   go build -ldflags "-X main.appVersion=0.3.1" .
+//
+//	go build -ldflags "-X main.appVersion=0.3.2" .
 const (
 	appName      = "goip-bridge"
 	appTagline   = "GoIP SMS/USSD gateway"
-	appCopyright = "Copyright (c) 2026 Evgenii Shapovalov"
+	appRepoURL   = "https://github.com/e-u-shapovalov/goip-bridge"
+	appCopyright = "(c) Evgenii Shapovalov 2026"
 )
 
-var appVersion = "0.3.1"
+var appVersion = "0.3.2"
+
+// printBanner writes the two-line identity header (repo URL + copyright/version) shown as the first
+// thing at startup and next to the first-run config prompt.
+func printBanner(w io.Writer) {
+	fmt.Fprintln(w, appRepoURL)
+	fmt.Fprintf(w, "%s v%s\n", appCopyright, appVersion)
+}
 
 // ----------------------------------------------------------------------------
 // Config
@@ -63,21 +75,47 @@ type DBConfig struct {
 	PollSec     int    `json:"poll_sec"`
 }
 
+// PacingRange is the pause window (seconds) between consecutive sends on ONE line.
+// MinSec==MaxSec = fixed pause; MaxSec<=0 = no pause; otherwise a random value in [Min,Max].
+type PacingRange struct {
+	MinSec int `json:"min_sec"`
+	MaxSec int `json:"max_sec"`
+}
+
+// SendPacing throttles outbound SMS per line: a SIM sends one SMS at a time, so each
+// line sends serially and then waits a (random) delay before its next send. Default
+// applies to every line; PerLine overrides by line id. Absent in config = {3,10}.
+type SendPacing struct {
+	Default PacingRange            `json:"default"`
+	PerLine map[string]PacingRange `json:"per_line"`
+}
+
+// WebhookRetry controls reliable webhook delivery: events are held in RAM and retried
+// with exponential backoff (BaseSec, then doubling) for up to MaxHours. Absent = {3,5}.
+type WebhookRetry struct {
+	MaxHours int `json:"max_hours"`
+	BaseSec  int `json:"base_sec"`
+}
+
 type Config struct {
-	ListenUDP      string            `json:"listen_udp"`      // device-facing, e.g. "172.16.172.3:44444"
-	ListenHTTP     string            `json:"listen_http"`     // API, e.g. "127.0.0.1:8080"
-	HTTPToken      string            `json:"http_token"`      // Bearer token for the API ("" = open)
-	WebhookURL     string            `json:"webhook_url"`     // optional POST of inbound SMS + DLR ("" = off)
-	WebhookToken   string            `json:"webhook_token"`   // sent as Bearer to the webhook
+	ListenUDP      string            `json:"listen_udp"`    // device-facing, e.g. "172.16.172.3:44444"
+	ListenHTTP     string            `json:"listen_http"`   // API, e.g. "127.0.0.1:8080"
+	HTTPToken      string            `json:"http_token"`    // Bearer token for the API ("" = open)
+	WebhookURL     string            `json:"webhook_url"`   // optional POST of inbound SMS, DLR and queue result events ("" = off)
+	WebhookToken   string            `json:"webhook_token"` // sent as Bearer to the webhook
 	SendTimeout    int               `json:"send_timeout_sec"`
 	USSDTimeout    int               `json:"ussd_timeout_sec"`
 	USSDRetransmit int               `json:"ussd_retransmit_sec"`
 	Debug          bool              `json:"debug"`               // detailed SMS/USSD/inbound logging to file
+	DebugLine      bool              `json:"debug_line"`          // per-line raw keepalive log (incl. password) to goip-bridge.line-<id>.log, each capped at 3 MB
 	LogMaxMB       int               `json:"log_max_mb"`          // per-file log cap in MB (default 10)
 	LineDeadSec    int               `json:"line_dead_after_sec"` // line treated as dead after this many seconds without keepalive (default 120)
 	AllowSrc       []string          `json:"allow_src"`           // optional CIDR/IP allow-list for device UDP packets (empty = accept all; firewall is then the only barrier)
 	DB             *DBConfig         `json:"db"`                  // optional MySQL integration (absent = off)
-	LinePasswords  map[string]string `json:"line_passwords"`      // optional per-line password override; else learned from keepalive
+	LinePasswords  map[string]string `json:"line_passwords"`      // per-line password: presented when sending AND (if set) required on inbound packets; unset = learned from keepalive
+	SendPacing     *SendPacing       `json:"send_pacing"`         // per-line outbound throttle (absent = random 3-10s between sends on a line)
+	DefaultLines   []string          `json:"default_lines"`       // round-robin set for outbox rows with line=NULL/'' (empty = all alive lines)
+	WebhookRetry   *WebhookRetry     `json:"webhook_retry"`       // reliable webhook delivery (absent = up to 3h, base 5s backoff)
 
 	allowNets []*net.IPNet // parsed AllowSrc (populated by loadConfig)
 }
@@ -122,7 +160,7 @@ func loadConfig(path string) (*Config, error) {
 		return nil, err
 	}
 	c := &Config{}
-	if err := json.Unmarshal(b, c); err != nil {
+	if err := json.Unmarshal(stripJSONComments(b), c); err != nil {
 		return nil, err
 	}
 	if c.ListenUDP == "" {
@@ -131,19 +169,21 @@ func loadConfig(path string) (*Config, error) {
 	if c.ListenHTTP == "" {
 		c.ListenHTTP = "127.0.0.1:8080"
 	}
-	if c.SendTimeout == 0 {
+	// Use <= 0 (not == 0) so a negative misconfig falls back to the default instead of reaching
+	// time.NewTicker/NewTimer (a non-positive duration panics the ticker / busy-loops the timer).
+	if c.SendTimeout <= 0 {
 		c.SendTimeout = 45
 	}
-	if c.USSDTimeout == 0 {
+	if c.USSDTimeout <= 0 {
 		c.USSDTimeout = 120
 	}
-	if c.USSDRetransmit == 0 {
+	if c.USSDRetransmit <= 0 {
 		c.USSDRetransmit = 60
 	}
-	if c.LogMaxMB == 0 {
+	if c.LogMaxMB <= 0 {
 		c.LogMaxMB = 10
 	}
-	if c.LineDeadSec == 0 {
+	if c.LineDeadSec <= 0 {
 		c.LineDeadSec = 120
 	}
 	if c.DB != nil {
@@ -159,8 +199,8 @@ func loadConfig(path string) (*Config, error) {
 		if c.DB.OutboxTable == "" {
 			c.DB.OutboxTable = "goip_outbox"
 		}
-		if c.DB.PollSec == 0 {
-			c.DB.PollSec = 2
+		if c.DB.PollSec <= 0 {
+			c.DB.PollSec = 3
 		}
 		// Table names are interpolated into SQL (drivers can't parameterize identifiers),
 		// so validate them as plain identifiers even though config is trusted.
@@ -171,12 +211,160 @@ func loadConfig(path string) (*Config, error) {
 	if c.LinePasswords == nil {
 		c.LinePasswords = map[string]string{}
 	}
+	if c.SendPacing == nil {
+		c.SendPacing = &SendPacing{Default: PacingRange{MinSec: 3, MaxSec: 10}}
+	}
+	if c.SendPacing.PerLine == nil {
+		c.SendPacing.PerLine = map[string]PacingRange{}
+	}
+	if c.WebhookRetry == nil {
+		c.WebhookRetry = &WebhookRetry{}
+	}
+	if c.WebhookRetry.MaxHours <= 0 {
+		c.WebhookRetry.MaxHours = 3
+	}
+	if c.WebhookRetry.BaseSec <= 0 {
+		c.WebhookRetry.BaseSec = 5
+	}
 	nets, err := parseAllowSrc(c.AllowSrc)
 	if err != nil {
 		return nil, err
 	}
 	c.allowNets = nets
 	return c, nil
+}
+
+// stripJSONComments lets the config be JSONC: it removes // line comments and
+// /* */ block comments (ignoring those inside strings, so "http://..." is safe)
+// and drops trailing commas before } or ]. On comment-free strict JSON it is a
+// no-op, so existing configs keep working unchanged.
+func stripJSONComments(b []byte) []byte {
+	out := make([]byte, 0, len(b))
+	inStr, esc := false, false
+	pendingComma := -1 // index in out of a comma awaiting a verdict, or -1
+	for i := 0; i < len(b); i++ {
+		c := b[i]
+		if inStr {
+			out = append(out, c)
+			switch {
+			case esc:
+				esc = false
+			case c == '\\':
+				esc = true
+			case c == '"':
+				inStr = false
+			}
+			continue
+		}
+		if c == '/' && i+1 < len(b) && b[i+1] == '/' { // line comment
+			for i < len(b) && b[i] != '\n' {
+				i++
+			}
+			if i < len(b) {
+				out = append(out, '\n') // preserve line numbers in parse errors
+			}
+			continue
+		}
+		if c == '/' && i+1 < len(b) && b[i+1] == '*' { // block comment
+			i += 2
+			for i+1 < len(b) && !(b[i] == '*' && b[i+1] == '/') {
+				i++
+			}
+			i++ // land on the '/'; outer loop's i++ steps past it
+			continue
+		}
+		switch c {
+		case '"':
+			pendingComma = -1
+			inStr = true
+			out = append(out, c)
+		case ' ', '\t', '\r', '\n':
+			out = append(out, c)
+		case ',':
+			out = append(out, c)
+			pendingComma = len(out) - 1
+		case '}', ']':
+			if pendingComma >= 0 { // it was a trailing comma — drop it
+				out = append(out[:pendingComma], out[pendingComma+1:]...)
+				pendingComma = -1
+			}
+			out = append(out, c)
+		default:
+			pendingComma = -1
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// stdinIsTTY reports whether stdin is an interactive terminal (so we may prompt).
+func stdinIsTTY() bool {
+	fi, err := os.Stdin.Stat()
+	return err == nil && fi.Mode()&os.ModeCharDevice != 0
+}
+
+// promptConfigLang asks interactively which language the generated config should
+// use and waits for ru/en. Returns "" on EOF / no terminal.
+func promptConfigLang() string {
+	fmt.Fprint(os.Stderr, "На каком языке создать конфиг? / Config language? [ru/en]: ")
+	r := bufio.NewReader(os.Stdin)
+	for {
+		line, err := r.ReadString('\n')
+		switch strings.ToLower(strings.TrimSpace(line)) {
+		case "ru", "rus", "russian", "ру", "рус":
+			return "ru"
+		case "en", "eng", "english", "ен", "англ":
+			return "en"
+		}
+		if err != nil {
+			return ""
+		}
+		fmt.Fprint(os.Stderr, "Введите ru или en / type ru or en: ")
+	}
+}
+
+// writeDefaultConfig creates a fully-annotated JSONC config (lang = "ru" or "en").
+// It refuses to overwrite an existing file.
+func writeDefaultConfig(path, lang string) error {
+	if _, err := os.Stat(path); err == nil {
+		return fmt.Errorf("%q already exists — refusing to overwrite", path)
+	}
+	body := configTemplateEN
+	if lang == "ru" {
+		body = configTemplateRU
+	}
+	return os.WriteFile(path, []byte(body), 0o600) // config holds tokens/passwords
+}
+
+// afterCreateMsg is printed once a fresh config is written, telling the user the
+// minimum they must fill in before the daemon can do anything useful.
+func afterCreateMsg(lang, path string) string {
+	if lang == "ru" {
+		return fmt.Sprintf(`Конфиг создан: %s
+
+Теперь откройте его и заполните минимально необходимое для старта:
+  • http_token   — длинный случайный токен для HTTP API (иначе API открыт всем)
+  • listen_udp   — порт должен совпадать с "SMS Server Port" в каждом GoIP
+
+И выберите способ интеграции (одно из двух):
+  • webhook_url  — получать входящие SMS, DLR и результаты очереди по HTTP-вебхуку, ИЛИ
+  • раскомментируйте блок "db" — если используете очередь MySQL (outbox/inbox)
+
+Потом запустите снова:  ./%s -config %s
+`, path, appName, path)
+	}
+	return fmt.Sprintf(`Config created: %s
+
+Now open it and fill in the minimum required to start:
+  • http_token   — a long random token for the HTTP API (otherwise the API is open)
+  • listen_udp   — the port must match "SMS Server Port" in every GoIP
+
+And pick one integration mode:
+  • webhook_url  — receive inbound SMS, DLR and queue results via HTTP webhook, OR
+  • uncomment the "db" block — if you use the MySQL queue (outbox/inbox)
+
+Then run again:  ./%s -config %s
+`, path, appName, path)
 }
 
 // ----------------------------------------------------------------------------
@@ -200,6 +388,10 @@ func newCappedWriter(path string, maxBytes int64) *cappedWriter {
 func (cw *cappedWriter) reopen() {
 	f, err := os.OpenFile(cw.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600) // logs hold phone numbers + SMS text
 	if err != nil {
+		// Clear the handle: after a failed rotation the old *os.File is already Closed, and without
+		// this the Write guard (cw.f == nil) wouldn't catch it — every later write would go to a dead
+		// fd (silently dropped) and re-enter rotation. nil makes those writes no-op until the disk frees.
+		cw.f = nil
 		fmt.Fprintf(os.Stderr, "WARN: cannot open log %s: %v\n", cw.path, err)
 		return
 	}
@@ -274,8 +466,9 @@ type Server struct {
 	inboxMu sync.Mutex
 	inbox   []Inbound // ring buffer of recent inbound messages
 
-	seenMu sync.Mutex
-	seen   map[string]time.Time // dedup of inbound RECEIVE/DELIVER (key = "verb:line:seq")
+	seenMu    sync.Mutex
+	seen      map[string]time.Time // dedup of inbound RECEIVE/DELIVER (key = "verb:line:seq")
+	seenPurge time.Time            // last time old dedup keys were evicted (time-based, not size-based)
 
 	webhookSem chan struct{}
 	httpClient *http.Client
@@ -285,25 +478,66 @@ type Server struct {
 	draining bool           // set true at shutdown; blocks new sends from registering
 	fbMu     sync.Mutex
 	fbPath   string // goip-bridge.fallback.jsonl — durable record of DB writes that exhausted retries
+
+	logDir    string                   // dir holding the logs; per-line debug logs (debug_line) live here too
+	lineLogMu sync.Mutex               // guards lineLogs
+	lineLogs  map[string]*cappedWriter // debug_line: line id -> its own raw keepalive log (lazy)
+
+	paceMu       sync.Mutex           // guards lineBusy/lineNextSend/rrIdx/lineSends
+	lineBusy     map[string]bool      // a send is in flight on this line (one SMS at a time per SIM)
+	lineNextSend map[string]time.Time // earliest moment this line may send again (pacing)
+	rrIdx        int                  // round-robin cursor for outbox rows with line=NULL
+	lineSends    map[string][]sendRec // per-line ring of recent send outcomes (channel health)
+
+	whMu    sync.Mutex      // guards whQueue
+	whQueue []*webhookEvent // reliable webhook delivery queue (in RAM, retried with backoff)
+}
+
+// sendRec is one recent send outcome for a line (channel-health ring).
+type sendRec struct {
+	ok bool
+	at time.Time
+}
+
+// webhookEvent is one pending webhook delivery held in RAM until a 2xx (or max_hours).
+type webhookEvent struct {
+	payload  map[string]any
+	body     []byte
+	attempt  int
+	inflight bool
+	firstAt  time.Time
+	nextAt   time.Time
 }
 
 const inboxCap = 500
 
+// maxSMSTextBytes caps the SMS body so it can't overflow a UDP datagram (~65507 B). An oversized
+// text would make WriteToUDP fail and leave sendSMS waiting out send_timeout_sec, blocking the line.
+// 4096 bytes is far above any real SMS (even long multipart) yet well under the datagram limit.
+const maxSMSTextBytes = 4096
+
+// maxUSSDCodeLen caps the USSD code at the outbox to_number column width (VARCHAR(64)); a longer
+// value would be silently truncated by MySQL (or rejected in strict mode) and sent as a wrong code.
+const maxUSSDCodeLen = 64
+
 func newServer(cfg *Config) *Server {
 	return &Server{
-		cfg:        cfg,
-		lines:      map[string]*Line{},
-		seen:       map[string]time.Time{},
-		seq:        uint64(time.Now().Unix()),
-		elog:       log.New(os.Stderr, "", log.LstdFlags), // replaced in main once log files are open
-		webhookSem: make(chan struct{}, 16),
-		httpClient: &http.Client{Timeout: 15 * time.Second},
+		cfg:          cfg,
+		lines:        map[string]*Line{},
+		seen:         map[string]time.Time{},
+		seq:          uint64(time.Now().Unix()),
+		elog:         log.New(os.Stderr, "", log.LstdFlags), // replaced in main once log files are open
+		webhookSem:   make(chan struct{}, 16),
+		httpClient:   &http.Client{Timeout: 15 * time.Second},
+		lineBusy:     map[string]bool{},
+		lineNextSend: map[string]time.Time{},
+		lineSends:    map[string][]sendRec{},
 	}
 }
 
-func (s *Server) DB() *sql.DB     { return s.dbp.Load() }
-func (s *Server) nextID() string  { return strconv.FormatUint(atomic.AddUint64(&s.seq, 1), 10) }
-func (s *Server) outbox() string  { return s.cfg.DB.OutboxTable }
+func (s *Server) DB() *sql.DB    { return s.dbp.Load() }
+func (s *Server) nextID() string { return strconv.FormatUint(atomic.AddUint64(&s.seq, 1), 10) }
+func (s *Server) outbox() string { return s.cfg.DB.OutboxTable }
 
 // dbg logs detailed SMS/USSD/inbound activity only when debug is enabled (never keepalive).
 func (s *Server) dbg(format string, a ...any) {
@@ -347,6 +581,13 @@ func (s *Server) lineAlive(ln *Line) bool {
 	return ln.Alive && time.Since(ln.LastSeen) < time.Duration(s.cfg.LineDeadSec)*time.Second
 }
 
+// lineCount returns how many lines have ever registered (an upper bound on sends per poll).
+func (s *Server) lineCount() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.lines)
+}
+
 // sendTo writes a raw protocol line to a device address.
 func (s *Server) sendTo(addr *net.UDPAddr, msg string) {
 	if addr == nil {
@@ -357,22 +598,26 @@ func (s *Server) sendTo(addr *net.UDPAddr, msg string) {
 	}
 }
 
-// seenRecently reports whether key was already recorded (and records it now). Entries are kept
-// until the map grows past 8192, after which those older than 10 minutes are purged — so the
-// practical dedup window is "at least 10 minutes" (effectively longer at low traffic).
-// Used to drop retransmitted RECEIVE/DELIVER packets (the device repeats them if our ack is lost).
+const seenWindow = 10 * time.Minute // dedup retention for retransmitted RECEIVE/DELIVER packets
+
+// seenRecently reports whether key was already recorded (and records it now). Old keys are purged
+// on a time basis (at most once a minute), so the dedup window stays ~10 minutes regardless of
+// traffic. The previous size-only purge (>8192 entries) let keys live indefinitely at low traffic,
+// which could falsely drop a genuinely new RECEIVE/DELIVER after a device reboot reused a seq, and
+// let the map grow without bound during a high-traffic burst.
 func (s *Server) seenRecently(key string) bool {
 	s.seenMu.Lock()
 	defer s.seenMu.Unlock()
 	now := time.Now()
 	_, dup := s.seen[key]
 	s.seen[key] = now
-	if len(s.seen) > 8192 {
+	if now.Sub(s.seenPurge) > time.Minute {
 		for k, t := range s.seen {
-			if now.Sub(t) > 10*time.Minute {
+			if now.Sub(t) > seenWindow {
 				delete(s.seen, k)
 			}
 		}
+		s.seenPurge = now
 	}
 	return dup
 }
@@ -479,8 +724,13 @@ func splitColonEvent(p string) (verb, seq, rest string) {
 func fields(s string) (map[string]string, string) {
 	m := map[string]string{}
 	body := ""
-	if idx := strings.Index(s, "msg:"); idx >= 0 {
-		body = s[idx+len("msg:"):]
+	// Split on the ";msg:" field boundary (or a leading "msg:"), not the first "msg:" substring —
+	// otherwise a value of an earlier field that contains "msg:" would be mistaken for the body start.
+	if strings.HasPrefix(s, "msg:") {
+		body = s[len("msg:"):]
+		s = ""
+	} else if idx := strings.Index(s, ";msg:"); idx >= 0 {
+		body = s[idx+len(";msg:"):]
 		s = s[:idx]
 	}
 	for _, part := range strings.Split(s, ";") {
@@ -499,11 +749,31 @@ func fields(s string) (map[string]string, string) {
 // Keepalive
 // ----------------------------------------------------------------------------
 
+// linePassOK authenticates an inbound packet's password for a line. If the line
+// is pinned in line_passwords, the packet's password must match (constant-time);
+// if it is NOT pinned, any password is accepted (the learn-from-keepalive default).
+func (s *Server) linePassOK(id, got string) bool {
+	want, pinned := s.cfg.LinePasswords[id]
+	if !pinned {
+		return true
+	}
+	return subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1
+}
+
 func (s *Server) handleKeepalive(p string, addr *net.UDPAddr) {
 	_, seq, rest := splitColonEvent(p)
 	f, _ := fields(rest)
 	id := f["id"]
 	if id == "" {
+		return
+	}
+	if s.cfg.DebugLine {
+		// One file per line with the full raw keepalive (password, signal, IMEI/IMSI/ICCID, carrier...).
+		fmt.Fprintf(s.lineLog(id), "%s from=%s %s\n", time.Now().Format("2006-01-02 15:04:05.000"), addr, p)
+	}
+	if !s.linePassOK(id, first(f, "pass", "password")) {
+		// Pinned line + wrong password: don't register, don't even ack (reg).
+		s.dbg("rejected keepalive line=%s from %s: bad password", id, addr)
 		return
 	}
 	s.mu.Lock()
@@ -547,13 +817,25 @@ func (s *Server) handleReceive(p, seq string, addr *net.UDPAddr) {
 	f, body := fields(rest)
 	from := first(f, "srcnum", "num", "src", "sender")
 	line := f["id"]
+	if strings.TrimSpace(line) == "" { // can't route/store/dedup without a line id — drop, no ack
+		s.dbg("bad RECEIVE from %s: missing id", addr)
+		return
+	}
+	if !s.linePassOK(line, f["password"]) { // pinned line + wrong password: drop, no ack, no store
+		s.dbg("rejected RECEIVE line=%s from %s: bad password", line, addr)
+		return
+	}
 	s.sendTo(addr, fmt.Sprintf("RECEIVE %s OK", seq)) // ack first so the device stops retransmitting
-	if s.cfg.Debug { // flag inbound arriving from an IP that doesn't match the line's keepalive source
+	if s.cfg.Debug {                                  // flag inbound arriving from an IP that doesn't match the line's keepalive source
 		s.mu.RLock()
 		ln := s.lines[line]
+		var regIP net.IP // copy under the lock; handleKeepalive may swap ln.Addr concurrently
+		if ln != nil && ln.Addr != nil {
+			regIP = ln.Addr.IP
+		}
 		s.mu.RUnlock()
-		if ln != nil && ln.Addr != nil && !ln.Addr.IP.Equal(addr.IP) {
-			s.dbg("RX line=%s from unexpected ip %s (registered %s)", line, addr.IP, ln.Addr.IP)
+		if regIP != nil && !regIP.Equal(addr.IP) {
+			s.dbg("RX line=%s from unexpected ip %s (registered %s)", line, addr.IP, regIP)
 		}
 	}
 
@@ -568,7 +850,9 @@ func (s *Server) handleReceive(p, seq string, addr *net.UDPAddr) {
 	log.Printf("RECV line=%s from=%s len=%d", line, from, len(body))
 	s.dbg("RX line=%s from=%s text=%q", line, from, body)
 
-	if s.DB() != nil {
+	// Gate on cfg.DB (configured), not DB() (connected): if MySQL is mid-reconnect, insertInbox sees
+	// db==nil and records the SMS to the durable fallback journal instead of dropping it silently.
+	if s.cfg.DB != nil {
 		go s.insertInbox(line, from, body)
 	}
 	if s.cfg.WebhookURL != "" {
@@ -598,15 +882,25 @@ func (s *Server) handleDeliver(p, seq string, addr *net.UDPAddr) {
 	// DELIVER:<n>;id:<line>;password:<pwd>;sms_no:<k>;state:<s>   (state 0 = delivered)
 	_, _, rest := splitColonEvent(p)
 	f, _ := fields(rest)
-	s.sendTo(addr, fmt.Sprintf("DELIVER %s OK", seq))
 	line, smsNo, state := f["id"], f["sms_no"], f["state"]
+	if !s.linePassOK(line, f["password"]) { // pinned line + wrong password: drop, no ack
+		s.dbg("rejected DELIVER line=%s from %s: bad password", line, addr)
+		return
+	}
+	s.sendTo(addr, fmt.Sprintf("DELIVER %s OK", seq))
 	log.Printf("DLR line=%s sms_no=%s state=%s", line, smsNo, state)
 
 	if s.seenRecently("D:" + line + ":" + seq) {
 		return
 	}
-	if s.DB() != nil && smsNo != "" {
-		go s.applyDLR(line, smsNo, state)
+	// Only match a numeric sms_no against the BIGINT column (a junk value would be coerced by MySQL
+	// and could touch the wrong row). Gate on cfg.DB so a DLR during reconnect reaches the fallback.
+	if s.cfg.DB != nil {
+		if n, err := strconv.ParseInt(smsNo, 10, 64); err == nil && n > 0 {
+			go s.applyDLR(line, smsNo, state)
+		} else if smsNo != "" {
+			s.dbg("DLR line=%s ignored non-numeric sms_no=%q", line, smsNo)
+		}
 	}
 	if s.cfg.WebhookURL != "" {
 		s.fireWebhook(map[string]any{"type": "dlr", "line": line, "sms_no": smsNo, "state": state, "time": time.Now()})
@@ -659,13 +953,13 @@ func (s *Server) storeInbox(in Inbound) {
 // sendSMS drives one send and returns (ok, sms_no, detail). `line` must be a snapshot copy.
 //
 // Protocol: MSG -> dev:PASSWORD -> PASSWORD pass -> dev:SEND -> SEND ref num ->
-//           dev:WAIT -> dev:OK <id> <ref> <sms_no> (sent) | ERROR <id> <ref> errorstatus:<n>.
+//
+//	dev:WAIT -> dev:OK <id> <ref> <sms_no> (sent) | ERROR <id> <ref> errorstatus:<n>.
+//
 // Never re-send SEND while WAITing — the device performs a fresh send per SEND (duplicates).
 func (s *Server) sendSMS(line *Line, number, text string) (bool, string, string) {
-	if !s.beginSend() {
-		return false, "", "shutting_down"
-	}
-	defer s.inflight.Done()
+	// The caller registers/drains the in-flight send (beginSend / inflight.Done) so the whole
+	// operation — including the status write it performs afterwards — is covered on shutdown.
 	if line.Addr == nil {
 		return false, "", "no_address"
 	}
@@ -682,6 +976,7 @@ func (s *Server) sendSMS(line *Line, number, text string) (bool, string, string)
 
 	addr := line.Addr
 	send := func(m string) { s.sendTo(addr, m) }
+	pass := sanitizeProto(line.Password) // strip CR/LF so a learned password can't inject a protocol line
 	s.dbg("TX line=%s to=%s len=%d text=%q", line.ID, number, len(text), text)
 
 	send(fmt.Sprintf("MSG %s %d %s\n", id, len(text), text))
@@ -701,7 +996,7 @@ func (s *Server) sendSMS(line *Line, number, text string) (bool, string, string)
 			}
 			switch tok[0] {
 			case "PASSWORD":
-				send(fmt.Sprintf("PASSWORD %s %s\n", id, line.Password))
+				send(fmt.Sprintf("PASSWORD %s %s\n", id, pass))
 			case "SEND":
 				if !submitted {
 					send(fmt.Sprintf("SEND %s %s %s\n", id, ref, number))
@@ -735,10 +1030,7 @@ func (s *Server) sendSMS(line *Line, number, text string) (bool, string, string)
 // ----------------------------------------------------------------------------
 
 func (s *Server) sendUSSD(line *Line, code string) (string, error) {
-	if !s.beginSend() {
-		return "", fmt.Errorf("shutting down")
-	}
-	defer s.inflight.Done()
+	// In-flight registration/drain is owned by the caller (see sendSMS).
 	if line.Addr == nil {
 		return "", fmt.Errorf("line %s has no known address (no keepalive yet)", line.ID)
 	}
@@ -750,7 +1042,7 @@ func (s *Server) sendUSSD(line *Line, code string) (string, error) {
 
 	addr := line.Addr
 	send := func(m string) { s.sendTo(addr, m) }
-	cmd := fmt.Sprintf("USSD %s %s %s", id, line.Password, code) // no trailing newline (leaks into the code otherwise)
+	cmd := fmt.Sprintf("USSD %s %s %s", id, sanitizeProto(line.Password), code) // no trailing newline (leaks into the code otherwise)
 	s.dbg("USSD line=%s code=%s", line.ID, code)
 	send(cmd)
 
@@ -800,9 +1092,22 @@ func (s *Server) sendUSSD(line *Line, code string) (string, error) {
 
 func (s *Server) initDB() error {
 	c := s.cfg.DB
-	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?parseTime=true&charset=utf8mb4&loc=Local",
-		c.User, c.Password, c.Host, c.Port, c.Name)
-	db, err := sql.Open("mysql", dsn)
+	// Build the DSN via the driver's config so special characters in the password/db name are
+	// escaped (string concatenation breaks on '@' '/' ':' '?' in a password). The I/O timeouts
+	// bound every query at the connection level, so a hung MySQL can't block a goroutine forever.
+	mc := mysql.NewConfig()
+	mc.User = c.User
+	mc.Passwd = c.Password
+	mc.Net = "tcp"
+	mc.Addr = net.JoinHostPort(c.Host, strconv.Itoa(c.Port))
+	mc.DBName = c.Name
+	mc.ParseTime = true
+	mc.Loc = time.Local
+	mc.Params = map[string]string{"charset": "utf8mb4"}
+	mc.Timeout = 10 * time.Second      // dial timeout
+	mc.ReadTimeout = 30 * time.Second  // abort a query that hangs (network split / locked table)
+	mc.WriteTimeout = 30 * time.Second // abort a stalled write
+	db, err := sql.Open("mysql", mc.FormatDSN())
 	if err != nil {
 		return err
 	}
@@ -834,25 +1139,212 @@ func (s *Server) dbConnectRetry(ctx context.Context) {
 	}
 }
 
-// reconcileSending requeues rows left in 'sending' by a previous crash/restart
-// (only those that never reached 'sent', i.e. sent_at IS NULL).
+// reconcileSending resolves rows left in 'sending' by a previous crash/restart. The two message
+// types are handled differently on purpose:
+//
+//   - USSD is NOT idempotent — a re-send can repeat a charge or balance transfer, and a row stuck
+//     in 'sending' may already have reached the modem. So we never auto-resend it: it is failed and
+//     left for manual review.
+//   - SMS is re-sendable; a rare duplicate after a hard crash is tolerable and better than a lost
+//     message, so a stuck SMS goes back to 'queued'.
+//
+// A graceful shutdown never leaves a transmitted row here (sends are drained first), so this only
+// runs for hard crashes / kills.
 func (s *Server) reconcileSending() {
 	db := s.DB()
 	if db == nil {
 		return
 	}
-	res, err := db.Exec("UPDATE " + s.outbox() + " SET status='queued' WHERE status='sending' AND sent_at IS NULL")
-	if err != nil {
-		s.elog.Printf("reconcile sending: %v", err)
-		return
+	// Leave sent_at NULL: a row stuck in 'sending' was claimed but its sent_at is only written together
+	// with the final status, so it was (almost certainly) never transmitted. Stamping NOW() here would
+	// fake a "sent today" timestamp for messages that never left.
+	if res, err := db.Exec("UPDATE " + s.outbox() + " SET status='failed', error_code='interrupted' WHERE status='sending' AND type='ussd'"); err != nil {
+		s.elog.Printf("reconcile ussd: %v", err)
+	} else if n, _ := res.RowsAffected(); n > 0 {
+		log.Printf("reconciled %d interrupted USSD 'sending' -> failed (not auto-resent)", n)
 	}
-	if n, _ := res.RowsAffected(); n > 0 {
-		log.Printf("reconciled %d stuck 'sending' rows -> queued", n)
+	if res, err := db.Exec("UPDATE " + s.outbox() + " SET status='queued' WHERE status='sending' AND type<>'ussd' AND sent_at IS NULL"); err != nil {
+		s.elog.Printf("reconcile sms: %v", err)
+	} else if n, _ := res.RowsAffected(); n > 0 {
+		log.Printf("reconciled %d stuck SMS 'sending' -> queued", n)
 	}
 }
 
+// pacingFor returns the pacing window for a line (per-line override, else default).
+func (c *Config) pacingFor(line string) PacingRange {
+	if r, ok := c.SendPacing.PerLine[line]; ok {
+		return r
+	}
+	return c.SendPacing.Default
+}
+
+// pacingDelay is the pause to wait after a send on this line (0 = no pause).
+func (s *Server) pacingDelay(line string) time.Duration {
+	r := s.cfg.pacingFor(line)
+	if r.MaxSec <= 0 {
+		return 0
+	}
+	min, max := r.MinSec, r.MaxSec
+	if min < 0 {
+		min = 0
+	}
+	if max < min {
+		max = min
+	}
+	d := min
+	if max > min {
+		d = min + rand.Intn(max-min+1)
+	}
+	return time.Duration(d) * time.Second
+}
+
+// aliveCandidates lists lines eligible for round-robin: default_lines (in order)
+// filtered to alive, or — if default_lines is empty — all alive lines, sorted.
+func (s *Server) aliveCandidates() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var c []string
+	if len(s.cfg.DefaultLines) > 0 {
+		for _, id := range s.cfg.DefaultLines {
+			if ln := s.lines[id]; ln != nil && s.lineAlive(ln) {
+				c = append(c, id)
+			}
+		}
+		return c
+	}
+	for id, ln := range s.lines {
+		if s.lineAlive(ln) {
+			c = append(c, id)
+		}
+	}
+	sort.Strings(c)
+	return c
+}
+
+// lineReadyLocked reports whether a line can start a send now (idle + pacing elapsed). Hold paceMu.
+func (s *Server) lineReadyLocked(id string) bool {
+	return !s.lineBusy[id] && !time.Now().Before(s.lineNextSend[id])
+}
+
+// claimLineForSend marks a specific line busy if it is alive and ready; false otherwise.
+func (s *Server) claimLineForSend(id string) bool {
+	s.mu.RLock()
+	ln := s.lines[id]
+	alive := ln != nil && s.lineAlive(ln)
+	s.mu.RUnlock()
+	if !alive {
+		return false
+	}
+	s.paceMu.Lock()
+	defer s.paceMu.Unlock()
+	if !s.lineReadyLocked(id) {
+		return false
+	}
+	s.lineBusy[id] = true
+	return true
+}
+
+// pickRoundRobin returns the next ready candidate (round-robin) and marks it busy, or "".
+func (s *Server) pickRoundRobin() string {
+	cands := s.aliveCandidates()
+	if len(cands) == 0 {
+		return ""
+	}
+	s.paceMu.Lock()
+	defer s.paceMu.Unlock()
+	n := len(cands)
+	for k := 0; k < n; k++ {
+		id := cands[(s.rrIdx+k)%n]
+		if s.lineReadyLocked(id) {
+			s.rrIdx = (s.rrIdx + k + 1) % 1000000
+			s.lineBusy[id] = true
+			return id
+		}
+	}
+	return ""
+}
+
+// releaseLine clears the busy flag WITHOUT a pacing penalty (no SMS was transmitted).
+func (s *Server) releaseLine(id string) {
+	s.paceMu.Lock()
+	s.lineBusy[id] = false
+	s.paceMu.Unlock()
+}
+
+// finishLine clears busy and arms the pacing delay (called after a real send attempt).
+func (s *Server) finishLine(id string) {
+	s.paceMu.Lock()
+	s.lineNextSend[id] = time.Now().Add(s.pacingDelay(id))
+	s.lineBusy[id] = false
+	s.paceMu.Unlock()
+}
+
+// newGUID returns an unguessable public message id: microtime (for rough ordering in logs)
+// plus 96 bits of crypto-random. The random part keeps /status/{guid} and /message/{guid}
+// non-enumerable even when the API token is weak or absent.
+func (s *Server) newGUID() string {
+	var b [12]byte
+	if _, err := crand.Read(b[:]); err != nil { // crypto source unavailable: fall back to the counter
+		return fmt.Sprintf("%d-%s", time.Now().UnixMicro(), s.nextID())
+	}
+	return fmt.Sprintf("%d-%x", time.Now().UnixMicro(), b[:])
+}
+
+const lineSendsCap = 20      // recent outcomes kept per line
+const suspectFailStreak = 10 // consecutive failures that flag a channel as suspect
+
+// recordSend appends a send outcome to a line's channel-health ring.
+func (s *Server) recordSend(line string, ok bool) {
+	s.paceMu.Lock()
+	r := append(s.lineSends[line], sendRec{ok: ok, at: time.Now()})
+	if len(r) > lineSendsCap {
+		r = r[len(r)-lineSendsCap:]
+	}
+	s.lineSends[line] = r
+	s.paceMu.Unlock()
+}
+
+// channelHealth summarizes a line's state for webhook/status payloads: alive, how long
+// since the last keepalive, and a recent-failure streak that hints at ban / no balance.
+func (s *Server) channelHealth(line string) map[string]any {
+	s.mu.RLock()
+	ln := s.lines[line]
+	alive := ln != nil && s.lineAlive(ln)
+	var lastSeenAgo interface{}
+	if ln != nil && !ln.LastSeen.IsZero() {
+		lastSeenAgo = int(time.Since(ln.LastSeen).Seconds())
+	}
+	s.mu.RUnlock()
+	s.paceMu.Lock()
+	recs := s.lineSends[line]
+	streak := 0
+	for i := len(recs) - 1; i >= 0; i-- {
+		if recs[i].ok {
+			break
+		}
+		streak++
+	}
+	total := len(recs)
+	s.paceMu.Unlock()
+	h := map[string]any{
+		"line": line, "alive": alive, "last_seen_ago_sec": lastSeenAgo,
+		"recent_sends": total, "recent_fail_streak": streak, "suspect": false,
+	}
+	if streak >= suspectFailStreak {
+		h["suspect"] = true
+		h["suspect_reason"] = fmt.Sprintf("%d sends in a row failed — possible ban or no balance", streak)
+	}
+	return h
+}
+
+type outboxJob struct {
+	id         int64
+	guid, line sql.NullString
+	typ, to    string
+	text       sql.NullString
+}
+
 func (s *Server) outboxLoop(ctx context.Context) {
-	sem := make(chan struct{}, 8) // max concurrent sends across lines
 	t := time.NewTicker(time.Duration(s.cfg.DB.PollSec) * time.Second)
 	defer t.Stop()
 	for {
@@ -866,67 +1358,150 @@ func (s *Server) outboxLoop(ctx context.Context) {
 			continue
 		}
 		ot := s.outbox()
-		rows, err := db.Query("SELECT id, line, to_number, text FROM " + ot +
-			" WHERE status='queued' ORDER BY id LIMIT 100")
-		if err != nil {
-			s.elog.Printf("outbox query: %v", err)
-			continue
-		}
-		type job struct {
-			id       int64
-			line     sql.NullString
-			to, text string
-		}
-		var jobs []job
-		for rows.Next() {
-			var j job
-			if err := rows.Scan(&j.id, &j.line, &j.to, &j.text); err != nil {
-				s.elog.Printf("outbox scan: %v", err)
-				continue
-			}
-			jobs = append(jobs, j)
-		}
-		if err := rows.Err(); err != nil {
-			s.elog.Printf("outbox rows: %v", err)
-		}
-		rows.Close()
-		for _, j := range jobs {
-			res, err := db.Exec("UPDATE "+ot+" SET status='sending' WHERE id=? AND status='queued'", j.id)
+
+		// A SIM sends one message at a time, so a line takes at most ONE send at a time and only
+		// after its pacing delay elapses. Rows whose target line is dead/busy/not-yet-due stay
+		// 'queued' and are retried next poll. We page through the queue by id rather than reading a
+		// single LIMIT 100: otherwise a front-of-queue batch bound to a dead/busy line would block
+		// routable rows behind it (head-of-line blocking). Stop once every line already has a send
+		// this tick (can't start more than one per line), the queue is drained, or a page cap hits.
+		lineCount := s.lineCount()
+		notReady := map[string]bool{} // lines confirmed busy/dead this tick (skipped without re-locking)
+		rrDead := false               // round-robin found no ready line this tick
+		dispatched := 0
+		lastID := int64(0)
+		for page := 0; page < 20; page++ {
+			rows, err := db.Query("SELECT id, guid, line, type, to_number, text FROM "+ot+
+				" WHERE status='queued' AND id > ? ORDER BY id LIMIT 100", lastID)
 			if err != nil {
-				s.elog.Printf("outbox claim: %v", err)
-				continue
+				s.elog.Printf("outbox query: %v", err)
+				break
 			}
-			if n, _ := res.RowsAffected(); n == 0 {
-				continue
+			var jobs []outboxJob
+			for rows.Next() {
+				var j outboxJob
+				if err := rows.Scan(&j.id, &j.guid, &j.line, &j.typ, &j.to, &j.text); err != nil {
+					s.elog.Printf("outbox scan: %v", err)
+					continue
+				}
+				jobs = append(jobs, j)
 			}
-			sem <- struct{}{}
-			go func(id int64, lineID, to, text string) {
-				defer func() {
-					if r := recover(); r != nil {
-						s.elog.Printf("processSend panic id=%d: %v", id, r)
-						s.execRetry("UPDATE "+s.outbox()+" SET status='queued' WHERE id=? AND status='sending'", id)
+			if err := rows.Err(); err != nil {
+				s.elog.Printf("outbox rows: %v", err)
+			}
+			rows.Close()
+			if len(jobs) == 0 {
+				break
+			}
+			for _, j := range jobs {
+				lastID = j.id
+
+				typ := strings.TrimSpace(j.typ)
+				if typ == "" {
+					typ = "sms"
+				}
+				if typ != "sms" && typ != "ussd" { // unknown type: never send it, fail for review
+					s.execRetry("UPDATE "+ot+" SET status='failed', error_code='bad_type' WHERE id=? AND status='queued'", j.id)
+					continue
+				}
+
+				var target string
+				if id := strings.TrimSpace(j.line.String); j.line.Valid && id != "" {
+					if notReady[id] {
+						continue
 					}
-					<-sem
-				}()
-				s.processSend(id, lineID, to, text)
-			}(j.id, j.line.String, j.to, j.text)
+					if s.claimLineForSend(id) {
+						target = id
+					} else {
+						notReady[id] = true
+						continue
+					}
+				} else {
+					if rrDead {
+						continue
+					}
+					if target = s.pickRoundRobin(); target == "" { // marks the chosen line busy
+						rrDead = true
+						continue
+					}
+				}
+
+				guid := j.guid.String
+				if guid == "" {
+					guid = s.newGUID() // app inserted the row without a guid — assign one at claim
+				}
+				res, err := db.Exec("UPDATE "+ot+" SET status='sending', guid=? WHERE id=? AND status='queued'", guid, j.id)
+				if err != nil {
+					s.elog.Printf("outbox claim: %v", err)
+					s.releaseLine(target)
+					continue
+				}
+				if n, _ := res.RowsAffected(); n == 0 {
+					s.releaseLine(target) // another worker / a cancel took the row — no pacing penalty
+					continue
+				}
+				go s.processSend(j.id, guid, typ, target, j.to, j.text.String)
+				dispatched++
+			}
+			if len(jobs) < 100 {
+				break // queue drained
+			}
+			if lineCount > 0 && dispatched >= lineCount {
+				break // every line already has a send this tick; the rest must wait
+			}
 		}
 	}
 }
 
-func (s *Server) processSend(id int64, lineID, to, text string) {
+// processSend runs one outbox row (sms or ussd) through the already-claimed line `lineID`,
+// writes the result back, records channel health, and arms the pacing delay. The line was
+// marked busy by the caller; `to` holds the recipient (sms) or the USSD code (ussd).
+func (s *Server) processSend(id int64, guid, typ, lineID, to, text string) {
+	// Own the in-flight registration for the WHOLE row (send + status write + webhook enqueue) so a
+	// shutdown drains it fully. If we're already draining, the row was never transmitted: leave it
+	// 'sending' (sent_at NULL) for reconcileSending to requeue (SMS) / fail (USSD).
+	if !s.beginSend() {
+		s.releaseLine(lineID)
+		return
+	}
+	defer s.inflight.Done()
+	defer func() {
+		if r := recover(); r != nil {
+			s.elog.Printf("processSend panic id=%d: %v", id, r)
+			// Release the line FIRST: if execRetry below panics too, the line must not stay busy forever.
+			s.releaseLine(lineID)
+			// We can't know whether the device was already hit — fail rather than requeue, so a
+			// send is never silently duplicated. The status guard avoids clobbering a written result.
+			s.execRetry("UPDATE "+s.outbox()+" SET status='failed', error_code='panic' WHERE id=? AND status='sending'", id)
+		}
+	}()
 	ot := s.outbox()
 	ln := s.pickLine(lineID)
-	if ln == nil {
-		s.execRetry("UPDATE "+ot+" SET status='queued' WHERE id=?", id) // no alive line — retry next poll
+	if ln == nil { // line died between routing and now — requeue, no pacing penalty
+		s.execRetry("UPDATE "+ot+" SET status='queued' WHERE id=?", id)
+		s.releaseLine(lineID)
 		return
 	}
+
+	if typ == "ussd" {
+		reply, err := s.sendUSSD(ln, to) // to_number holds the USSD code
+		if err != nil {
+			s.execRetry("UPDATE "+ot+" SET status='failed', error_code=?, line=?, sent_at=NOW() WHERE id=?",
+				err.Error(), ln.ID, id)
+			s.fireWebhook(map[string]any{"type": "failed", "id": guid, "msg_type": "ussd", "line": ln.ID,
+				"error": err.Error(), "channel": s.channelHealth(ln.ID), "time": time.Now()})
+		} else {
+			s.execRetry("UPDATE "+ot+" SET status='done', reply=?, error_code=NULL, line=?, sent_at=NOW() WHERE id=?",
+				reply, ln.ID, id)
+			s.fireWebhook(map[string]any{"type": "done", "id": guid, "msg_type": "ussd", "line": ln.ID,
+				"reply": reply, "channel": s.channelHealth(ln.ID), "time": time.Now()})
+		}
+		s.recordSend(lineID, err == nil)
+		s.finishLine(lineID)
+		return
+	}
+
 	ok, smsNo, detail := s.sendSMS(ln, to, text)
-	if detail == "shutting_down" {
-		// Never attempted (shutdown in progress). Leave the row 'sending' with sent_at NULL so the
-		// next start's reconcileSending puts it back to 'queued' — no duplicate, no loss.
-		return
-	}
 	if ok {
 		var smsNoVal interface{}
 		if n, err := strconv.Atoi(smsNo); err == nil {
@@ -934,10 +1509,16 @@ func (s *Server) processSend(id int64, lineID, to, text string) {
 		}
 		s.execRetry("UPDATE "+ot+" SET status='sent', sms_no=?, line=?, error_code=NULL, sent_at=NOW() WHERE id=?",
 			smsNoVal, ln.ID, id)
+		s.fireWebhook(map[string]any{"type": "sent", "id": guid, "msg_type": "sms", "line": ln.ID,
+			"sms_no": smsNo, "channel": s.channelHealth(ln.ID), "time": time.Now()})
 	} else {
 		s.execRetry("UPDATE "+ot+" SET status='failed', error_code=?, line=?, sent_at=NOW() WHERE id=?",
 			detail, ln.ID, id)
+		s.fireWebhook(map[string]any{"type": "failed", "id": guid, "msg_type": "sms", "line": ln.ID,
+			"error": detail, "channel": s.channelHealth(ln.ID), "time": time.Now()})
 	}
+	s.recordSend(lineID, ok)
+	s.finishLine(lineID) // arm pacing delay after a real send attempt
 }
 
 // execRetry runs a write up to 3 times; the message is already sent at this point, so we
@@ -963,14 +1544,30 @@ func (s *Server) execRetry(query string, args ...interface{}) {
 // HTTP API
 // ----------------------------------------------------------------------------
 
-func (s *Server) httpLoop(ctx context.Context) {
+func (s *Server) httpLoop(ctx context.Context, ln net.Listener) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", s.method("GET", s.hHealth)) // unauthenticated; localhost-only listener
 	mux.HandleFunc("/lines", s.auth(s.method("GET", s.hLines)))
 	mux.HandleFunc("/sms", s.auth(s.method("POST", s.hSMS)))
 	mux.HandleFunc("/ussd", s.auth(s.method("POST", s.hUSSD)))
 	mux.HandleFunc("/inbox", s.auth(s.method("GET", s.hInbox)))
-	s.srv = &http.Server{Addr: s.cfg.ListenHTTP, Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+	mux.HandleFunc("/status/", s.auth(s.method("GET", s.hStatus)))     // /status/{guid}
+	mux.HandleFunc("/message/", s.auth(s.method("DELETE", s.hCancel))) // /message/{guid}
+	// WriteTimeout must outlast the longest synchronous handler: in no-DB mode /sms blocks up to
+	// send_timeout_sec and /ussd up to ussd_timeout_sec while the device responds. The read-side
+	// timeouts (header/body/idle) bound slow clients without cutting off a legitimately slow send.
+	writeTO := s.cfg.SendTimeout
+	if s.cfg.USSDTimeout > writeTO {
+		writeTO = s.cfg.USSDTimeout
+	}
+	s.srv = &http.Server{
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		WriteTimeout:      time.Duration(writeTO+15) * time.Second,
+		MaxHeaderBytes:    1 << 14,
+	}
 	go func() {
 		<-ctx.Done()
 		sc, cancel := context.WithTimeout(context.Background(), time.Duration(s.cfg.SendTimeout+5)*time.Second)
@@ -978,8 +1575,10 @@ func (s *Server) httpLoop(ctx context.Context) {
 		s.srv.Shutdown(sc)
 	}()
 	log.Printf("HTTP API on %s", s.cfg.ListenHTTP)
-	if err := s.srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		log.Fatalf("http: %v", err)
+	// The listener is already bound in main (so a bind failure is reported there with full cleanup);
+	// only an unexpected Serve error remains, which must NOT os.Exit and skip shutdown — just log it.
+	if err := s.srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		s.elog.Printf("http serve: %v", err)
 	}
 }
 
@@ -1046,7 +1645,58 @@ func (s *Server) hSMS(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]string{"error": "bad number"})
 		return
 	}
-	ln := s.pickLine(req.Line)
+	if len(req.Text) > maxSMSTextBytes {
+		writeJSON(w, 400, map[string]string{"error": "text too long"})
+		return
+	}
+	// With a DB configured, /sms is async: queue the row and return immediately. The scheduler
+	// sends it with per-channel pacing and reports the result via webhook + the DB row.
+	if s.cfg.DB != nil {
+		db := s.DB()
+		if db == nil { // configured but disconnected right now — don't silently drop to a sync send
+			writeJSON(w, 503, map[string]string{"error": "queue temporarily unavailable (db reconnecting)"})
+			return
+		}
+		guid := s.newGUID()
+		var lineVal interface{}
+		if strings.TrimSpace(req.Line) != "" {
+			lineVal = req.Line
+		}
+		if _, err := db.Exec("INSERT INTO "+s.outbox()+" (guid, type, line, to_number, text, status, created_at) VALUES (?, 'sms', ?, ?, ?, 'queued', NOW())",
+			guid, lineVal, req.To, req.Text); err != nil {
+			s.elog.Printf("enqueue sms: %v", err)
+			writeJSON(w, 500, map[string]string{"error": "enqueue failed"})
+			return
+		}
+		s.fireQueued(guid, "sms", req.Line, map[string]any{"to": req.To})
+		writeJSON(w, 202, map[string]any{"status": "accepted", "id": guid, "queued_at": time.Now().UnixMicro()})
+		return
+	}
+	// No DB configured: legacy synchronous direct send (result in the response).
+	if !s.beginSend() {
+		writeJSON(w, 503, map[string]string{"error": "shutting down"})
+		return
+	}
+	defer s.inflight.Done()
+	// Serialize per line as the queue does (a SIM sends one at a time): claim the line so two
+	// concurrent direct sends can't interleave SEND sessions on the same channel. releaseLine (not
+	// finishLine) keeps the no-DB path pacing-free — only genuine concurrency is rejected with 409.
+	target := strings.TrimSpace(req.Line)
+	if target == "" {
+		if target = s.pickRoundRobin(); target == "" {
+			writeJSON(w, 404, map[string]string{"error": "no alive line"})
+			return
+		}
+	} else if !s.claimLineForSend(target) {
+		if s.pickLine(target) == nil {
+			writeJSON(w, 404, map[string]string{"error": "no alive line"})
+		} else {
+			writeJSON(w, 409, map[string]string{"error": "line busy"})
+		}
+		return
+	}
+	defer s.releaseLine(target)
+	ln := s.pickLine(target)
 	if ln == nil {
 		writeJSON(w, 404, map[string]string{"error": "no alive line"})
 		return
@@ -1077,7 +1727,55 @@ func (s *Server) hUSSD(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]string{"error": "need code"})
 		return
 	}
-	ln := s.pickLine(req.Line)
+	if len(req.Code) > maxUSSDCodeLen {
+		writeJSON(w, 400, map[string]string{"error": "code too long"})
+		return
+	}
+	// With a DB configured, /ussd is async too: queue it; the reply arrives via webhook + reply column.
+	if s.cfg.DB != nil {
+		db := s.DB()
+		if db == nil { // configured but disconnected right now — don't silently drop to a sync send
+			writeJSON(w, 503, map[string]string{"error": "queue temporarily unavailable (db reconnecting)"})
+			return
+		}
+		guid := s.newGUID()
+		var lineVal interface{}
+		if strings.TrimSpace(req.Line) != "" {
+			lineVal = req.Line
+		}
+		if _, err := db.Exec("INSERT INTO "+s.outbox()+" (guid, type, line, to_number, status, created_at) VALUES (?, 'ussd', ?, ?, 'queued', NOW())",
+			guid, lineVal, req.Code); err != nil {
+			s.elog.Printf("enqueue ussd: %v", err)
+			writeJSON(w, 500, map[string]string{"error": "enqueue failed"})
+			return
+		}
+		s.fireQueued(guid, "ussd", req.Line, map[string]any{"code": req.Code})
+		writeJSON(w, 202, map[string]any{"status": "accepted", "id": guid, "queued_at": time.Now().UnixMicro()})
+		return
+	}
+	// No DB configured: legacy synchronous USSD (reply in the response).
+	if !s.beginSend() {
+		writeJSON(w, 503, map[string]string{"error": "shutting down"})
+		return
+	}
+	defer s.inflight.Done()
+	// Serialize per line (see hSMS): a USSD session and an SMS send can't share a SIM at once.
+	target := strings.TrimSpace(req.Line)
+	if target == "" {
+		if target = s.pickRoundRobin(); target == "" {
+			writeJSON(w, 404, map[string]string{"error": "no alive line"})
+			return
+		}
+	} else if !s.claimLineForSend(target) {
+		if s.pickLine(target) == nil {
+			writeJSON(w, 404, map[string]string{"error": "no alive line"})
+		} else {
+			writeJSON(w, 409, map[string]string{"error": "line busy"})
+		}
+		return
+	}
+	defer s.releaseLine(target)
+	ln := s.pickLine(target)
 	if ln == nil {
 		writeJSON(w, 404, map[string]string{"error": "no alive line"})
 		return
@@ -1088,6 +1786,111 @@ func (s *Server) hUSSD(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]string{"reply": reply, "line": ln.ID})
+}
+
+// hStatus reports a message's state by guid: status, fields, queue position (while queued,
+// computed via COUNT — no stored position), and the channel's health. Unknown guid -> 404.
+func (s *Server) hStatus(w http.ResponseWriter, r *http.Request) {
+	guid := strings.TrimPrefix(r.URL.Path, "/status/")
+	if guid == "" {
+		writeJSON(w, 400, map[string]string{"error": "need id"})
+		return
+	}
+	db := s.DB()
+	if db == nil {
+		writeJSON(w, 404, map[string]string{"error": "no queue (db off)"})
+		return
+	}
+	ot := s.outbox()
+	var (
+		id                                          int64
+		line, typ, to, text, status, errCode, reply sql.NullString
+		smsNo                                       sql.NullInt64
+		createdAt                                   sql.NullTime
+	)
+	err := db.QueryRow("SELECT id, line, type, to_number, text, status, sms_no, error_code, reply, created_at FROM "+ot+
+		" WHERE guid=? ORDER BY id DESC LIMIT 1", guid).
+		Scan(&id, &line, &typ, &to, &text, &status, &smsNo, &errCode, &reply, &createdAt)
+	if err == sql.ErrNoRows {
+		writeJSON(w, 404, map[string]string{"error": "not found"})
+		return
+	}
+	if err != nil {
+		s.elog.Printf("status query: %v", err)
+		writeJSON(w, 500, map[string]string{"error": "db"})
+		return
+	}
+	resp := map[string]any{"id": guid, "status": status.String, "type": typ.String, "line": line.String, "to": to.String}
+	if text.Valid {
+		resp["text"] = text.String
+	}
+	if reply.Valid {
+		resp["reply"] = reply.String
+	}
+	if errCode.Valid {
+		resp["error_code"] = errCode.String
+	}
+	if smsNo.Valid {
+		resp["sms_no"] = smsNo.Int64
+	}
+	if createdAt.Valid {
+		resp["queued_at"] = createdAt.Time
+	}
+	if status.String == "queued" { // position is only meaningful while waiting
+		// One snapshot query (two separate COUNTs could read an inconsistent pair) with a checked error.
+		var before, after sql.NullInt64
+		if err := db.QueryRow("SELECT "+
+			"SUM(CASE WHEN id < ? THEN 1 ELSE 0 END), "+
+			"SUM(CASE WHEN id > ? THEN 1 ELSE 0 END) "+
+			"FROM "+ot+" WHERE status='queued'", id, id).Scan(&before, &after); err != nil {
+			s.elog.Printf("status position: %v", err)
+		} else {
+			resp["position"] = before.Int64 + 1
+			resp["before"] = before.Int64
+			resp["after"] = after.Int64
+		}
+	}
+	if line.Valid && line.String != "" {
+		resp["channel"] = s.channelHealth(line.String)
+	}
+	writeJSON(w, 200, resp)
+}
+
+// hCancel cancels a still-queued message by guid. Already sending/sent -> 409; unknown -> 404.
+func (s *Server) hCancel(w http.ResponseWriter, r *http.Request) {
+	guid := strings.TrimPrefix(r.URL.Path, "/message/")
+	if guid == "" {
+		writeJSON(w, 400, map[string]string{"error": "need id"})
+		return
+	}
+	db := s.DB()
+	if db == nil {
+		writeJSON(w, 404, map[string]string{"error": "no queue (db off)"})
+		return
+	}
+	ot := s.outbox()
+	res, err := db.Exec("UPDATE "+ot+" SET status='cancelled' WHERE guid=? AND status='queued'", guid)
+	if err != nil {
+		s.elog.Printf("cancel: %v", err)
+		writeJSON(w, 500, map[string]string{"error": "db"})
+		return
+	}
+	if n, _ := res.RowsAffected(); n > 0 {
+		writeJSON(w, 200, map[string]string{"id": guid, "status": "cancelled"})
+		return
+	}
+	// Nothing cancelled: distinguish "already past queued" from "never existed".
+	var status sql.NullString
+	err = db.QueryRow("SELECT status FROM "+ot+" WHERE guid=? ORDER BY id DESC LIMIT 1", guid).Scan(&status)
+	if err == sql.ErrNoRows {
+		writeJSON(w, 404, map[string]string{"error": "not found"})
+		return
+	}
+	if err != nil {
+		writeJSON(w, 500, map[string]string{"error": "db"})
+		return
+	}
+	writeJSON(w, 409, map[string]string{"error": "too late", "status": status.String})
 }
 
 func (s *Server) hInbox(w http.ResponseWriter, r *http.Request) {
@@ -1107,7 +1910,14 @@ func (s *Server) hHealth(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	s.mu.RUnlock()
-	writeJSON(w, 200, map[string]any{"ok": true, "lines": total, "alive": alive, "db": s.DB() != nil})
+	// Report a LIVE db state: the pointer stays set after MySQL goes down, so ping (briefly) instead.
+	dbOK := false
+	if db := s.DB(); db != nil {
+		ctx, cancel := context.WithTimeout(r.Context(), time.Second)
+		defer cancel()
+		dbOK = db.PingContext(ctx) == nil
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "lines": total, "alive": alive, "db": dbOK})
 }
 
 // pickLine returns a SNAPSHOT COPY of the named line (if alive), or, when id=="",
@@ -1148,34 +1958,177 @@ func (s *Server) pickLine(id string) *Line {
 // Webhook + helpers + main
 // ----------------------------------------------------------------------------
 
+// fireQueued emits the "queued" webhook event (with channel health when a line is known).
+func (s *Server) fireQueued(guid, msgType, line string, extra map[string]any) {
+	ev := map[string]any{"type": "queued", "id": guid, "msg_type": msgType, "line": line, "time": time.Now()}
+	for k, v := range extra {
+		ev[k] = v
+	}
+	if strings.TrimSpace(line) != "" {
+		ev["channel"] = s.channelHealth(line)
+	}
+	s.fireWebhook(ev)
+}
+
+const webhookQueueCap = 10000 // max pending webhook events held in RAM
+
+// fireWebhook enqueues an event for reliable delivery (retried with exponential backoff up to
+// webhook_retry.max_hours). A no-op when no webhook_url is configured.
 func (s *Server) fireWebhook(payload map[string]any) {
-	select {
-	case s.webhookSem <- struct{}{}:
-	default:
-		s.elog.Printf("webhook backpressure, dropping event")
+	if s.cfg.WebhookURL == "" {
 		return
 	}
-	go func() {
-		defer func() { <-s.webhookSem }()
-		b, _ := json.Marshal(payload)
-		req, err := http.NewRequest("POST", s.cfg.WebhookURL, bytes.NewReader(b))
-		if err != nil {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return
+	}
+	now := time.Now()
+	s.whMu.Lock()
+	if len(s.whQueue) >= webhookQueueCap {
+		s.whMu.Unlock()
+		s.elog.Printf("webhook queue full (%d), dropping event (saved to fallback)", webhookQueueCap)
+		s.appendFallback(map[string]any{"kind": "webhook_drop_full", "payload": payload, "ts": now.Format(time.RFC3339)})
+		return
+	}
+	s.whQueue = append(s.whQueue, &webhookEvent{payload: payload, body: body, firstAt: now, nextAt: now})
+	s.whMu.Unlock()
+}
+
+// flushPendingWebhooks drains the in-RAM webhook queue to the fallback journal. Called once at
+// shutdown (the worker has stopped) so events awaiting retry are recorded for replay rather than
+// lost with the process. A delivery still in flight is also recorded — at worst the receiver gets
+// it twice, which is safer than dropping it.
+func (s *Server) flushPendingWebhooks() {
+	s.whMu.Lock()
+	pend := s.whQueue
+	s.whQueue = nil
+	s.whMu.Unlock()
+	for _, e := range pend {
+		s.appendFallback(map[string]any{"kind": "webhook_pending_shutdown", "payload": e.payload, "attempts": e.attempt, "ts": time.Now().Format(time.RFC3339)})
+	}
+	if len(pend) > 0 {
+		log.Printf("flushed %d pending webhook(s) to fallback on shutdown", len(pend))
+	}
+}
+
+// webhookWorker drains the in-RAM webhook queue: delivers due events, reschedules failures
+// with exponential backoff (base_sec, then doubling), and drops events older than max_hours
+// (recorded to the fallback journal). Delivery concurrency is bounded by webhookSem.
+func (s *Server) webhookWorker(ctx context.Context) {
+	t := time.NewTicker(time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
 			return
+		case <-t.C:
 		}
-		req.Header.Set("Content-Type", "application/json")
-		if s.cfg.WebhookToken != "" {
-			req.Header.Set("Authorization", "Bearer "+s.cfg.WebhookToken)
+		now := time.Now()
+		maxAge := time.Duration(s.cfg.WebhookRetry.MaxHours) * time.Hour
+		budget := cap(s.webhookSem) // start at most this many deliveries per tick (bounds goroutines)
+		var due []*webhookEvent
+		var expired []map[string]any
+		s.whMu.Lock()
+		kept := s.whQueue[:0]
+		for _, e := range s.whQueue {
+			if now.Sub(e.firstAt) > maxAge && !e.inflight { // don't expire one that's mid-delivery — it may still 2xx
+				expired = append(expired, map[string]any{"kind": "webhook_drop_expired", "payload": e.payload, "attempts": e.attempt, "ts": now.Format(time.RFC3339)})
+				continue
+			}
+			if !e.inflight && !now.Before(e.nextAt) && len(due) < budget {
+				e.inflight = true
+				due = append(due, e)
+			}
+			kept = append(kept, e)
 		}
-		resp, err := s.httpClient.Do(req)
-		if err != nil {
-			s.elog.Printf("webhook error: %v", err)
-			return
+		for i := len(kept); i < len(s.whQueue); i++ {
+			s.whQueue[i] = nil // drop stale pointers in the tail so GC can reclaim removed events
 		}
-		resp.Body.Close()
+		s.whQueue = kept
+		s.whMu.Unlock()
+		for _, rec := range expired { // file I/O outside whMu so a slow disk can't stall the whole queue
+			s.elog.Printf("webhook give up after %s (saved to fallback)", maxAge)
+			s.appendFallback(rec)
+		}
+		for _, e := range due {
+			// Acquire the slot HERE, not inside the goroutine: with a slow/dead receiver this paces the
+			// worker instead of spawning a goroutine per due event that then piles up blocked on the
+			// semaphore. Stay responsive to shutdown while waiting for a slot.
+			select {
+			case s.webhookSem <- struct{}{}:
+				go s.deliverWebhook(e)
+			case <-ctx.Done():
+				return
+			}
+		}
+	}
+}
+
+// deliverWebhook POSTs one event; on a 2xx it leaves the queue, otherwise it backs off. The caller
+// (webhookWorker) holds one webhookSem slot for this delivery and we release it here. A panic in
+// postWebhook is contained so it can neither crash the daemon (unrecovered goroutine panic) nor
+// strand the slot/event.
+func (s *Server) deliverWebhook(e *webhookEvent) {
+	defer func() { <-s.webhookSem }()
+	ok := false
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				s.elog.Printf("deliverWebhook panic: %v", r)
+			}
+		}()
+		ok = s.postWebhook(e.body)
 	}()
+	s.whMu.Lock()
+	defer s.whMu.Unlock()
+	e.inflight = false
+	if ok {
+		for i, x := range s.whQueue {
+			if x == e {
+				s.whQueue = append(s.whQueue[:i], s.whQueue[i+1:]...)
+				break
+			}
+		}
+		return
+	}
+	e.attempt++
+	delay := time.Duration(s.cfg.WebhookRetry.BaseSec) * time.Second
+	for i := 1; i < e.attempt && delay < 6*time.Hour; i++ {
+		delay *= 2 // base, 2*base, 4*base, ... (capped below to avoid int64 overflow at huge attempts)
+	}
+	if delay > 6*time.Hour {
+		delay = 6 * time.Hour
+	}
+	e.nextAt = time.Now().Add(delay)
+}
+
+// postWebhook delivers the body and reports whether the receiver accepted it (HTTP 2xx).
+func (s *Server) postWebhook(body []byte) bool {
+	req, err := http.NewRequest("POST", s.cfg.WebhookURL, bytes.NewReader(body))
+	if err != nil {
+		return false
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if s.cfg.WebhookToken != "" {
+		req.Header.Set("Authorization", "Bearer "+s.cfg.WebhookToken)
+	}
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		s.elog.Printf("webhook post: %v", err)
+		return false
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	return resp.StatusCode >= 200 && resp.StatusCode < 300
 }
 
 func atoi(s string) int { n, _ := strconv.Atoi(strings.TrimSpace(s)); return n }
+
+// weakHTTPToken reports whether the API token offers no real protection: empty, the shipped
+// placeholder ("CHANGE_ME..."), or too short to resist guessing.
+func weakHTTPToken(t string) bool {
+	return t == "" || strings.HasPrefix(t, "CHANGE_ME") || len(t) < 16
+}
 
 // isLoopbackAddr reports whether a listen address is bound to loopback only.
 func isLoopbackAddr(addr string) bool {
@@ -1186,8 +2139,10 @@ func isLoopbackAddr(addr string) bool {
 	if host == "" {
 		return false // ":8080" binds every interface
 	}
-	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return host == "localhost" // ParseIP doesn't resolve names; treat the literal as loopback
 }
 
 func first(m map[string]string, keys ...string) string {
@@ -1221,29 +2176,154 @@ func (s *Server) appendFallback(rec map[string]any) {
 		return
 	}
 	defer f.Close()
-	b, _ := json.Marshal(rec)
-	f.Write(append(b, '\n'))
+	b, err := json.Marshal(rec)
+	if err != nil { // never emit a bare newline that loses the record — dump a readable form instead
+		s.elog.Printf("fallback marshal: %v", err)
+		b = []byte(fmt.Sprintf("%+v", rec))
+	}
+	if _, err := f.Write(append(b, '\n')); err != nil { // last-resort durable record — never lose it silently
+		s.elog.Printf("fallback write %s: %v", s.fbPath, err)
+		return
+	}
+	f.Sync() // recovery journal of last resort: flush to disk before returning so a crash can't drop it
 }
 
 func setupLogging(s *Server, cfgPath string) {
 	dir := filepath.Dir(cfgPath)
+	s.logDir = dir
 	s.fbPath = filepath.Join(dir, "goip-bridge.fallback.jsonl")
 	max := int64(s.cfg.LogMaxMB) * 1024 * 1024
 	mainCW := newCappedWriter(filepath.Join(dir, "goip-bridge.log"), max)
 	errCW := newCappedWriter(filepath.Join(dir, "goip-bridge.err.log"), max)
 	log.SetOutput(io.MultiWriter(os.Stderr, mainCW))
 	s.elog = log.New(io.MultiWriter(os.Stderr, mainCW, errCW), "", log.LstdFlags)
-	log.Printf("%s v%s — %s. %s", appName, appVersion, appTagline, appCopyright) // first echo: what version started
-	log.Printf("logging to %s (goip-bridge.log + .err.log, cap %d MB, debug=%v)", dir, s.cfg.LogMaxMB, s.cfg.Debug)
+	printBanner(io.MultiWriter(os.Stderr, mainCW)) // identity header (no timestamp) to screen + log file
+	log.Printf("logging to %s (goip-bridge.log + .err.log, cap %d MB, debug=%v debug_line=%v)", dir, s.cfg.LogMaxMB, s.cfg.Debug, s.cfg.DebugLine)
+}
+
+// logEffectiveConfig prints the settings the daemon is actually running with (after
+// defaults are applied, secrets masked) so the log shows exactly what was picked up.
+func (s *Server) logEffectiveConfig() {
+	c := s.cfg
+	mask := func(v string) string {
+		if v == "" {
+			return "empty"
+		}
+		return "set"
+	}
+	row := func(name, value, desc string) { log.Printf("  %-15s %-24s %s", name, value, desc) }
+	allow := "all (firewall only)"
+	if len(c.AllowSrc) > 0 {
+		allow = fmt.Sprintf("%v", c.AllowSrc)
+	}
+	lines := "all alive (round-robin)"
+	if len(c.DefaultLines) > 0 {
+		lines = fmt.Sprintf("%v", c.DefaultLines)
+	}
+	dp := c.SendPacing.Default
+
+	log.Printf("config in effect (v%s) — applied values:", appVersion)
+	row("listen_udp", c.ListenUDP, "UDP port GoIP lines register on")
+	row("listen_http", c.ListenHTTP, "HTTP API bind address (/sms /ussd /status ...)")
+	row("http_token", mask(c.HTTPToken), "Bearer required by the API (empty = open)")
+	row("allow_src", allow, "source-IP filter for device packets")
+	row("webhook_url", mask(c.WebhookURL), "POST target for inbound SMS + send results (empty = off)")
+	row("webhook_token", mask(c.WebhookToken), "Bearer sent to the webhook")
+	row("webhook_retry", fmt.Sprintf("max %dh, base %ds", c.WebhookRetry.MaxHours, c.WebhookRetry.BaseSec), "reliable webhook backoff window")
+	row("send_timeout", fmt.Sprintf("%ds", c.SendTimeout), "give up an SMS send after this")
+	row("ussd_timeout", fmt.Sprintf("%ds", c.USSDTimeout), "give up a USSD session after this")
+	row("ussd_retransmit", fmt.Sprintf("%ds", c.USSDRetransmit), "re-send USSD if no reply within this")
+	row("line_dead", fmt.Sprintf("%ds", c.LineDeadSec), "line silent this long = dead (not routable)")
+	row("send_pacing", fmt.Sprintf("%d-%ds", dp.MinSec, dp.MaxSec), "pause between sends on one line (default)")
+	for id, r := range c.SendPacing.PerLine {
+		row("  per_line["+id+"]", fmt.Sprintf("%d-%ds", r.MinSec, r.MaxSec), "per-line pacing override")
+	}
+	row("default_lines", lines, "lines for queue rows without a line")
+	row("line_passwords", fmt.Sprintf("%d pinned", len(c.LinePasswords)), "per-line inbound password pins")
+	row("debug", fmt.Sprintf("%v", c.Debug), "verbose SMS/USSD/inbound logging")
+	row("debug_line", fmt.Sprintf("%v", c.DebugLine), "per-line raw keepalive logs (incl. password)")
+	row("log_max_mb", fmt.Sprintf("%d", c.LogMaxMB), "per-file log cap (MB)")
+	if c.DB != nil {
+		row("db", fmt.Sprintf("%s:%d/%s", c.DB.Host, c.DB.Port, c.DB.Name),
+			fmt.Sprintf("MySQL queue: inbox=%s outbox=%s poll=%ds (connecting...)", c.DB.InboxTable, c.DB.OutboxTable, c.DB.PollSec))
+	} else {
+		row("db", "off", "not configured — HTTP API / webhook only, no inbox/outbox queue")
+	}
+}
+
+const lineLogMaxBytes = 3 * 1024 * 1024 // per-line keepalive log cap (debug_line); rotates to ".1"
+
+var fnameUnsafeRE = regexp.MustCompile(`[^A-Za-z0-9._-]+`)
+
+// safeFileToken makes a line id safe to embed in a filename (ids come straight
+// from the device and are otherwise untrusted).
+func safeFileToken(s string) string {
+	t := fnameUnsafeRE.ReplaceAllString(s, "_")
+	if t == "" || t == "." || t == ".." {
+		t = "_"
+	}
+	if len(t) > 64 {
+		t = t[:64]
+	}
+	return t
+}
+
+// lineLog returns (creating on first use) the per-line writer used when
+// debug_line is on. Files sit next to the main log, one per line id, each capped
+// at lineLogMaxBytes. They hold the RAW keepalive — INCLUDING the line password —
+// so they are mode 0600 and meant for local debugging only.
+func (s *Server) lineLog(id string) *cappedWriter {
+	s.lineLogMu.Lock()
+	defer s.lineLogMu.Unlock()
+	if s.lineLogs == nil {
+		s.lineLogs = map[string]*cappedWriter{}
+	}
+	w := s.lineLogs[id]
+	if w == nil {
+		w = newCappedWriter(filepath.Join(s.logDir, "goip-bridge.line-"+safeFileToken(id)+".log"), lineLogMaxBytes)
+		s.lineLogs[id] = w
+	}
+	return w
 }
 
 func main() {
 	cfgPath := flag.String("config", "config.json", "path to config file")
 	showVersion := flag.Bool("version", false, "print version and exit")
+	initLang := flag.String("init", "", "create an annotated config at -config path and exit (value: ru or en)")
 	flag.Parse()
 	if *showVersion {
-		fmt.Printf("%s v%s — %s. %s\n", appName, appVersion, appTagline, appCopyright)
+		printBanner(os.Stdout)
+		fmt.Printf("%s — %s\n", appName, appTagline)
 		return
+	}
+
+	// Self-create the config: explicit `-init ru|en`, or first run when the file is
+	// missing (prompt on a terminal, otherwise print how to create it and exit).
+	_, statErr := os.Stat(*cfgPath)
+	missing := errors.Is(statErr, os.ErrNotExist)
+	if *initLang != "" || missing {
+		printBanner(os.Stderr)
+		lang := strings.ToLower(*initLang)
+		if lang == "" {
+			if stdinIsTTY() {
+				lang = promptConfigLang()
+			}
+			if lang == "" {
+				fmt.Fprintf(os.Stderr, "config %q not found. Create it with one of:\n"+
+					"  ./%s -config %s -init ru   # русские комментарии\n"+
+					"  ./%s -config %s -init en   # English comments\n",
+					*cfgPath, appName, *cfgPath, appName, *cfgPath)
+				os.Exit(1)
+			}
+		}
+		if lang != "ru" && lang != "en" {
+			log.Fatalf("-init must be \"ru\" or \"en\" (got %q)", *initLang)
+		}
+		if err := writeDefaultConfig(*cfgPath, lang); err != nil {
+			log.Fatalf("create config: %v", err)
+		}
+		fmt.Fprint(os.Stderr, afterCreateMsg(lang, *cfgPath))
+		os.Exit(0)
 	}
 
 	cfg, err := loadConfig(*cfgPath)
@@ -1262,33 +2342,47 @@ func main() {
 	if err != nil {
 		log.Fatalf("listen udp %s: %v", cfg.ListenUDP, err)
 	}
+	// Bind the HTTP listener here (not inside the goroutine): a bind failure is then reported in main
+	// with normal exit, instead of a log.Fatalf inside httpLoop that would os.Exit and skip cleanup.
+	httpLn, err := net.Listen("tcp", cfg.ListenHTTP)
+	if err != nil {
+		conn.Close()
+		log.Fatalf("listen http %s: %v", cfg.ListenHTTP, err)
+	}
 
 	s := newServer(cfg)
 	s.conn = conn
 	setupLogging(s, *cfgPath)
+	s.logEffectiveConfig()
 
-	if cfg.HTTPToken == "" && !isLoopbackAddr(cfg.ListenHTTP) {
-		log.Printf("WARNING: http_token is empty and the API listens on %s (non-loopback) — the send API is OPEN to the network", cfg.ListenHTTP)
+	if weakHTTPToken(cfg.HTTPToken) && !isLoopbackAddr(cfg.ListenHTTP) {
+		log.Printf("WARNING: http_token is empty, a placeholder, or too short and the API listens on %s (non-loopback) — the send API is effectively OPEN to the network", cfg.ListenHTTP)
 	}
 	if len(cfg.allowNets) > 0 {
 		log.Printf("device packets restricted to allow_src %v", cfg.AllowSrc)
+	} else if len(cfg.LinePasswords) == 0 {
+		log.Printf("WARNING: allow_src is empty and no line_passwords are pinned — any UDP source can register lines and inject inbound SMS/DLR; the firewall is the only barrier")
 	}
 
 	if cfg.DB != nil {
 		if err := s.initDB(); err != nil {
-			s.elog.Printf("WARNING: MySQL connect failed, retrying in background: %v", err)
+			s.elog.Printf("db: configured but NOT connected (%s:%d/%s): %v — retrying in background; /sms and /ussd return 503 until connected",
+				cfg.DB.Host, cfg.DB.Port, cfg.DB.Name, err)
 			go s.dbConnectRetry(ctx)
 		} else {
-			log.Printf("MySQL connected: %s@%s:%d/%s (inbox=%s outbox=%s)",
-				cfg.DB.User, cfg.DB.Host, cfg.DB.Port, cfg.DB.Name, cfg.DB.InboxTable, cfg.DB.OutboxTable)
+			log.Printf("db: connected to %s@%s:%d/%s — inbox table %q + outbox queue %q active (poll %ds)",
+				cfg.DB.User, cfg.DB.Host, cfg.DB.Port, cfg.DB.Name, cfg.DB.InboxTable, cfg.DB.OutboxTable, cfg.DB.PollSec)
 			s.reconcileSending()
 			go s.outboxLoop(ctx)
 		}
+	} else {
+		log.Printf("db: not configured — inbox/outbox queue disabled; /sms and /ussd send synchronously, inbound SMS go to the webhook only")
 	}
 
 	log.Printf("goip-bridge listening on UDP %s (GoIP lines register here)", cfg.ListenUDP)
-	go s.httpLoop(ctx)
+	go s.httpLoop(ctx, httpLn)
 	go s.udpLoop(ctx)
+	go s.webhookWorker(ctx)
 
 	<-ctx.Done()
 	log.Printf("shutting down...")
@@ -1300,13 +2394,427 @@ func main() {
 	s.drainMu.Unlock()
 	drained := make(chan struct{})
 	go func() { s.inflight.Wait(); close(drained) }()
+	drainWait := cfg.SendTimeout
+	if cfg.USSDTimeout > drainWait { // a USSD send can run far longer than an SMS one
+		drainWait = cfg.USSDTimeout
+	}
 	select {
 	case <-drained:
-	case <-time.After(time.Duration(cfg.SendTimeout+5) * time.Second):
+	case <-time.After(time.Duration(drainWait+5) * time.Second):
 		s.elog.Printf("shutdown: gave up waiting for in-flight sends")
 	}
+	// Sends are drained (so no new events appear) and the webhook worker has already stopped on
+	// ctx.Done — persist whatever is still pending in RAM to the fallback journal for replay.
+	s.flushPendingWebhooks()
 	conn.Close()
 	if db := s.DB(); db != nil {
 		db.Close()
 	}
 }
+
+// ----------------------------------------------------------------------------
+// Annotated config templates (JSONC). Emitted by `-init ru|en` / first run.
+// The "db" block is commented out so one file covers both modes: leave it as is
+// for HTTP-API/webhook only, or uncomment it to enable the MySQL outbox/inbox.
+// ----------------------------------------------------------------------------
+
+const configTemplateRU = `{
+  // ══════════════════════════════════════════════════════════════
+  //  goip-bridge — конфигурация (формат JSONC: разрешены коммен-
+  //  тарии // и /* */ и висячие запятые). Пустое поле = значение
+  //  по умолчанию. Конфиг разбит на блоки по назначению.
+  // ══════════════════════════════════════════════════════════════
+
+  // ──────────────────────────────────────────────────────────────
+  //  БЛОК 1 · ПОДКЛЮЧЕНИЕ GoIP-ШЛЮЗОВ      (устройства → bridge, UDP)
+  //  Сюда «прозваниваются» все линии всех GoIP.
+  // ──────────────────────────────────────────────────────────────
+
+  // UDP-порт, на котором bridge СЛУШАЕТ устройства. Этот же порт
+  // пропишите в каждом GoIP как "SMS Server Port". ":44444" = все
+  // интерфейсы, порт 44444. У всех GoIP адрес сервера один и тот же —
+  // важно лишь, чтобы Client ID (id линии) НЕ повторялись.
+  "listen_udp": ":44444",
+
+  // С каких IP/подсетей ПРИНИМАТЬ пакеты от устройств (keepalive, SMS).
+  // Пусто [] = принимать со ВСЕХ (барьер тогда только фаервол).
+  // Если задать — пакет с любого ДРУГОГО IP, даже на правильный порт,
+  // молча игнорируется. Это и есть «кому верим». Пример:
+  //   "allow_src": ["192.168.1.0/24", "10.0.0.5"]
+  // Если линия перечислена в line_passwords ниже, bridge проверяет пароль
+  // входящих keepalive/SMS/DLR для этой линии. Если линия не перечислена,
+  // пароль принимается из keepalive устройства. Поэтому allow_src и firewall
+  // всё равно важны: они ограничивают, откуда вообще можно слать UDP-пакеты.
+  "allow_src": [],
+
+  // Пароли линий по их ID — работают в ОБЕ стороны:
+  //   • ОТПРАВКА: bridge предъявляет этот пароль устройству (SMS/USSD).
+  //   • ПРИЁМ: если линия здесь запинена, входящие пакеты (keepalive/SMS/DLR)
+  //     с НЕсовпадающим паролем молча отбрасываются (линия не регистрируется).
+  // Не запинена / пусто {} = «верить любому» паролю со шлюза (пароль просто
+  // учится из keepalive). Пример:
+  //   "line_passwords": {"Go1": "12345", "Go2": "qwerty"}
+  "line_passwords": {},
+
+  // ──────────────────────────────────────────────────────────────
+  //  БЛОК 2 · ВХОДЯЩИЙ HTTP — наш API         (ваши клиенты → bridge)
+  //  Отправка SMS/USSD, /lines, /inbox, /health.
+  // ──────────────────────────────────────────────────────────────
+
+  // Адрес, на котором bridge поднимает HTTP API.
+  // "127.0.0.1:8080" = только локально (безопасно). Наружу — только
+  // если задан http_token и вы понимаете риски.
+  "listen_http": "127.0.0.1:8080",
+
+  // Bearer-токен, который ВАШ клиент предъявляет bridge'у при запросе.
+  // Пусто = API открыт всем. ОБЯЗАТЕЛЬНО задайте длинную случайную
+  // строку, если API доступен по сети.
+  "http_token": "CHANGE_ME_TO_LONG_RANDOM_TOKEN",
+
+  // Примеры вызова API — отправка SMS на линию Go1 (подставьте http_token).
+  // При ВКЛЮЧЁННОЙ БД отправка АСИНХРОННАЯ: ответ сразу (HTTP 202)
+  //   {"status":"accepted","id":"<guid>","queued_at":<микротайм>},
+  //   а результат (sent/failed + sms_no/reply) приходит ВЕБХУКОМ (Блок 3).
+  //   Без БД — синхронно: {"line":"Go1","status":"sent","sms_no":123} (HTTP 200).
+  // Любая живая линия: уберите "line" или поставьте "line":"".
+  //
+  //   curl:
+  //     curl -X POST http://127.0.0.1:8080/sms \
+  //       -H "Authorization: Bearer <http_token>" \
+  //       -H "Content-Type: application/json" \
+  //       -d '{"line":"Go1","to":"+996700000001","text":"Привет"}'
+  //
+  //   PHP (file_get_contents):
+  //     $ctx = stream_context_create(["http" => [
+  //       "method"  => "POST",
+  //       "header"  => "Authorization: Bearer <http_token>\r\nContent-Type: application/json\r\n",
+  //       "content" => json_encode(["line"=>"Go1","to"=>"+996700000001","text"=>"Привет"]),
+  //       "timeout" => 10,
+  //     ]]);
+  //     $resp = @file_get_contents("http://127.0.0.1:8080/sms", false, $ctx);
+  //     // проверка: $resp===false => ошибка сети; иначе json с "status":"sent"/"failed"
+  //
+  //   Node.js:
+  //     await fetch("http://127.0.0.1:8080/sms", {
+  //       method: "POST",
+  //       headers: { "Authorization": "Bearer <http_token>", "Content-Type": "application/json" },
+  //       body: JSON.stringify({ line: "Go1", to: "+996700000001", text: "Привет" }),
+  //     });
+  //
+  //   USSD:    POST   /ussd  -d '{"line":"Go1","code":"*100#"}'   (тоже async при БД)
+  //   Статус:  GET    /status/<id>    (статус, позиция в очереди, здоровье канала)
+  //   Отмена:  DELETE /message/<id>   (если ещё в очереди → cancelled; иначе 409)
+  //   Линии:   GET    /lines          (все эндпоинты — с тем же Bearer)
+
+  // ──────────────────────────────────────────────────────────────
+  //  БЛОК 3 · ИСХОДЯЩИЙ HTTP — вебхук          (bridge → ваш сервер)
+  //  Bridge сам POST-ит вам входящие SMS и отчёты о доставке (DLR).
+  // ──────────────────────────────────────────────────────────────
+
+  // URL, куда bridge шлёт события {"type":"sms",...}, {"type":"dlr",...},
+  // {"type":"queued",...}, {"type":"sent",...}, {"type":"failed",...}
+  // и {"type":"done",...}. Пусто = вебхук выключен.
+  "webhook_url": "",
+
+  // Bearer-токен, который BRIDGE предъявляет ВАШЕМУ серверу (в заголовке
+  // Authorization) — чтобы вы убедились, что запрос правда от bridge.
+  "webhook_token": "",
+
+  // Надёжная доставка вебхука: события держатся в ОЗУ и ретраятся с растущей
+  // паузой (base_sec, дальше ×2: 5,10,20,40…), пока приёмник не ответит 2xx,
+  // максимум max_hours. По умолчанию (если блока нет): 3ч / 5с.
+  "webhook_retry": { "max_hours": 3, "base_sec": 5 },
+
+  // ──────────────────────────────────────────────────────────────
+  //  БЛОК 4 · ТАЙМАУТЫ ОТПРАВКИ              (bridge ↔ GoIP, секунды)
+  // ──────────────────────────────────────────────────────────────
+
+  // Сколько ждать подтверждения отправки SMS от GoIP. Не дождались →
+  // SMS помечается 'failed' (ошибка "timeout"), БЕЗ автоповтора. По умолчанию 45.
+  "send_timeout_sec": 45,
+
+  // Сколько ВСЕГО ждать ответа на USSD-запрос. Не дождались →
+  // вызов вернёт ошибку "ussd timeout". По умолчанию 120.
+  "ussd_timeout_sec": 120,
+
+  // Пока ждём ответ на USSD (до ussd_timeout_sec), КАЖДЫЕ столько секунд шлём
+  // тот же USSD-запрос ПОВТОРНО — на случай если пакет потерялся (UDP без гарантий).
+  // Повторы НЕ бесконечны: прекращаются, как только истечёт ussd_timeout_sec.
+  // Должно быть МЕНЬШЕ ussd_timeout_sec. Слишком часто нельзя — рвёт USSD-сессию
+  // у оператора, поэтому интервал большой. По умолчанию 60.
+  "ussd_retransmit_sec": 60,
+
+  // Темп рассылки в MySQL-очереди — пауза между заданиями на ОДНОМ канале.
+  // Планировщик очереди держит на линии только одну SMS/USSD за раз. default — для всех линий;
+  // per_line — переопределение по id линии (тот же Client ID, что в keepalive).
+  // min==max = фиксированная пауза, 0/0 = без паузы, иначе случайная в [min,max] сек.
+  // По умолчанию (если блока нет): 3–10с. per_line можно оставить пустым {} — тогда
+  // на всех линиях действует default. Ключ = id линии, значение = {min_sec,max_sec}.
+  // Раскомментируйте и поменяйте id под свои линии:
+  "send_pacing": {
+    "default":  { "min_sec": 3, "max_sec": 10 },
+    "per_line": {
+      // "Go1": { "min_sec": 5, "max_sec": 5  },   // фиксированные 5с между отправками на Go1
+      // "Go2": { "min_sec": 1, "max_sec": 40 },   // случайная пауза 1–40с на Go2
+      // "Go3": { "min_sec": 0, "max_sec": 0  }     // без паузы на Go3 (шлёт подряд)
+    }
+  },
+
+  // Какие линии брать для строк очереди БЕЗ линии (line=NULL/''):
+  // пусто [] = round-robin по всем живым; или список, напр. ["Go1","Go3"].
+  "default_lines": [],
+
+  // ──────────────────────────────────────────────────────────────
+  //  БЛОК 5 · ЛОГИ / ДИАГНОСТИКА
+  //  Логи goip-bridge.log + .err.log пишутся в ТУ ЖЕ папку, где лежит
+  //  этот конфиг (рядом с файлом из -config). Значения ниже — дефолтные.
+  // ──────────────────────────────────────────────────────────────
+
+  "debug": false,              // true = подробный лог каждой SMS/USSD (номера, текст). По умолчанию false.
+  "log_max_mb": 10,            // кап одного файла лога (goip-bridge.log/.err.log) в МБ.
+                               //   По умолчанию 10 (если не указано/0). При debug:true
+                               //   растёт быстро, потом ротация в .1.
+
+  // true = для КАЖДОЙ линии свой файл goip-bridge.line-<id>.log с полным
+  // «сырым» keepalive (ПАРОЛЬ, сигнал, IMEI/IMSI/ICCID, оператор, IP).
+  // Каждый файл ≤ 3 МБ (потом ротация в .1). ⚠ содержит пароли — локально.
+  "debug_line": false,
+
+  // Через сколько секунд без keepalive линия считается «мёртвой» (alive=false)
+  // и пропускается при отправке. По умолчанию 120.
+  "line_dead_after_sec": 120,
+
+  // ──────────────────────────────────────────────────────────────
+  //  БЛОК 6 · MySQL (опционально) — очередь outbox + входящие inbox
+  //  Раскомментируйте, чтобы включить. Без него bridge работает
+  //  только через HTTP API (Блок 2) и/или вебхук (Блок 3).
+  // ──────────────────────────────────────────────────────────────
+  // "db": {
+  //   "host": "127.0.0.1",
+  //   "port": 3306,
+  //   "user": "goip_bridge",
+  //   "password": "CHANGE_ME",
+  //   "name": "goip_go",
+  //   "inbox_table": "goip_inbox",
+  //   "outbox_table": "goip_outbox",
+  //   "poll_sec": 3              // как часто опрашивать outbox на новые сообщения (по умолчанию 3)
+  // }
+
+  // ──────────────────────────────────────────────────────────────
+  //  БЛОК 7 · ОТПРАВКА ЧЕРЕЗ ОЧЕРЕДЬ MySQL (Блок 6; это комментарий)
+  //  HTTP-примеры (curl/PHP/Node) — выше, в Блоке 2.
+  // ──────────────────────────────────────────────────────────────
+  //
+  //  Положить в очередь — просто INSERT в outbox (bridge заберёт сам). type='sms'|'ussd':
+  //    SMS на конкретную линию:
+  //      INSERT INTO goip_outbox (type, line, to_number, text, status)
+  //      VALUES ('sms', 'Go1', '+996700000001', 'Привет', 'queued');
+  //    SMS на любую живую (round-robin) — line = NULL:
+  //      INSERT INTO goip_outbox (type, line, to_number, text, status)
+  //      VALUES ('sms', NULL, '+996700000001', 'Привет', 'queued');
+  //    USSD (баланс) — to_number = код, ответ потом в колонке reply:
+  //      INSERT INTO goip_outbox (type, line, to_number, status)
+  //      VALUES ('ussd', 'Go1', '*100#', 'queued');
+  //    Статусы: queued -> sending -> sent->delivered (sms) | done (ussd) | failed | cancelled.
+}
+`
+
+const configTemplateEN = `{
+  // ══════════════════════════════════════════════════════════════
+  //  goip-bridge — configuration (JSONC: // and /* */ comments and
+  //  trailing commas are allowed). Empty field = default value.
+  //  The config is split into blocks by purpose.
+  // ══════════════════════════════════════════════════════════════
+
+  // ──────────────────────────────────────────────────────────────
+  //  BLOCK 1 · GoIP GATEWAY CONNECTION       (devices → bridge, UDP)
+  //  Every line of every GoIP registers here.
+  // ──────────────────────────────────────────────────────────────
+
+  // UDP port the bridge LISTENS on for devices. Set the same port in
+  // every GoIP as "SMS Server Port". ":44444" = all interfaces, port
+  // 44444. All GoIPs may share the same server address — only the
+  // Client ID (line id) must be unique.
+  "listen_udp": ":44444",
+
+  // Which IP/subnets to ACCEPT device packets (keepalive, SMS) from.
+  // Empty [] = accept from ALL (firewall is then the only barrier).
+  // If set, a packet from any OTHER IP — even on the right port — is
+  // silently ignored. This is the "who we trust" filter. Example:
+  //   "allow_src": ["192.168.1.0/24", "10.0.0.5"]
+  // If a line is listed in line_passwords below, the bridge checks the
+  // inbound keepalive/SMS/DLR password for that line. If a line is not listed,
+  // its password is learned from the device keepalive. allow_src and the
+  // firewall still matter: they limit who can send UDP packets at all.
+  "allow_src": [],
+
+  // Per-line passwords by ID — used BOTH ways:
+  //   • SENDING: the bridge presents this password to the device (SMS/USSD).
+  //   • RECEIVING: if a line is pinned here, inbound packets (keepalive/SMS/DLR)
+  //     whose password does NOT match are silently dropped (line not registered).
+  // Unpinned / empty {} = "trust any" password from the gateway (it is just
+  // learned from keepalive). Example:
+  //   "line_passwords": {"Go1": "12345", "Go2": "qwerty"}
+  "line_passwords": {},
+
+  // ──────────────────────────────────────────────────────────────
+  //  BLOCK 2 · INBOUND HTTP — our API           (your clients → bridge)
+  //  Send SMS/USSD, /lines, /inbox, /health.
+  // ──────────────────────────────────────────────────────────────
+
+  // Address the bridge serves the HTTP API on.
+  // "127.0.0.1:8080" = local only (safe). Expose it only if http_token
+  // is set and you understand the risks.
+  "listen_http": "127.0.0.1:8080",
+
+  // Bearer token YOUR client presents to the bridge on each request.
+  // Empty = API open to everyone. MUST be a long random string if the
+  // API is reachable over the network.
+  "http_token": "CHANGE_ME_TO_LONG_RANDOM_TOKEN",
+
+  // API call examples — send an SMS on line Go1 (use your http_token).
+  // With a DB the send is ASYNC: the response is immediate (HTTP 202)
+  //   {"status":"accepted","id":"<guid>","queued_at":<microtime>},
+  //   and the result (sent/failed + sms_no/reply) arrives via WEBHOOK (Block 3).
+  //   Without a DB it is synchronous: {"line":"Go1","status":"sent","sms_no":123} (HTTP 200).
+  // Any alive line: omit "line" or set "line":"".
+  //
+  //   curl:
+  //     curl -X POST http://127.0.0.1:8080/sms \
+  //       -H "Authorization: Bearer <http_token>" \
+  //       -H "Content-Type: application/json" \
+  //       -d '{"line":"Go1","to":"+996700000001","text":"Hello"}'
+  //
+  //   PHP (file_get_contents):
+  //     $ctx = stream_context_create(["http" => [
+  //       "method"  => "POST",
+  //       "header"  => "Authorization: Bearer <http_token>\r\nContent-Type: application/json\r\n",
+  //       "content" => json_encode(["line"=>"Go1","to"=>"+996700000001","text"=>"Hello"]),
+  //       "timeout" => 10,
+  //     ]]);
+  //     $resp = @file_get_contents("http://127.0.0.1:8080/sms", false, $ctx);
+  //     // check: $resp===false => network error; otherwise JSON with "status":"sent"/"failed"
+  //
+  //   Node.js:
+  //     await fetch("http://127.0.0.1:8080/sms", {
+  //       method: "POST",
+  //       headers: { "Authorization": "Bearer <http_token>", "Content-Type": "application/json" },
+  //       body: JSON.stringify({ line: "Go1", to: "+996700000001", text: "Hello" }),
+  //     });
+  //
+  //   USSD:    POST   /ussd  -d '{"line":"Go1","code":"*100#"}'   (async too with a DB)
+  //   Status:  GET    /status/<id>    (status, queue position, channel health)
+  //   Cancel:  DELETE /message/<id>   (still queued -> cancelled; otherwise 409)
+  //   Lines:   GET    /lines          (all endpoints use the same Bearer)
+
+  // ──────────────────────────────────────────────────────────────
+  //  BLOCK 3 · OUTBOUND HTTP — webhook           (bridge → your server)
+  //  The bridge POSTs inbound SMS and delivery reports (DLR) to you.
+  // ──────────────────────────────────────────────────────────────
+
+  // URL the bridge sends {"type":"sms",...}, {"type":"dlr",...},
+  // {"type":"queued",...}, {"type":"sent",...}, {"type":"failed",...}
+  // and {"type":"done",...} to. Empty = webhook off.
+  "webhook_url": "",
+
+  // Bearer token the BRIDGE presents to YOUR server (Authorization header)
+  // so you can verify the request really came from the bridge.
+  "webhook_token": "",
+
+  // Reliable webhook delivery: events are held in RAM and retried with growing
+  // backoff (base_sec, then doubling: 5,10,20,40…) until the receiver returns 2xx,
+  // up to max_hours. Defaults (if the block is absent): 3h / 5s.
+  "webhook_retry": { "max_hours": 3, "base_sec": 5 },
+
+  // ──────────────────────────────────────────────────────────────
+  //  BLOCK 4 · SEND TIMEOUTS                 (bridge ↔ GoIP, seconds)
+  // ──────────────────────────────────────────────────────────────
+
+  // How long to wait for the device to confirm an SMS send. On timeout the
+  // SMS is marked 'failed' (error "timeout"), with NO auto-retry. Default 45.
+  "send_timeout_sec": 45,
+
+  // Total time to wait for a USSD reply. On timeout the call returns the
+  // error "ussd timeout". Default 120.
+  "ussd_timeout_sec": 120,
+
+  // While waiting for the USSD reply (up to ussd_timeout_sec), re-send the same
+  // USSD request every this many seconds — in case a packet was lost (UDP is
+  // lossy). Retries are NOT infinite: they stop once ussd_timeout_sec elapses.
+  // Must be LESS than ussd_timeout_sec. Too often breaks the operator's USSD
+  // session, so keep it large. Default 60.
+  "ussd_retransmit_sec": 60,
+
+  // Send pacing in MySQL queue mode — pause between jobs on ONE channel.
+  // The queue scheduler keeps only one SMS/USSD in flight per line. default applies to all
+  // lines; per_line overrides by line id (the same Client ID seen in keepalive).
+  // min==max = fixed pause, 0/0 = no pause, otherwise random in [min,max] sec.
+  // Default (if the block is absent): 3-10s. per_line may stay empty {} — then
+  // default applies to every line. Key = line id, value = {min_sec,max_sec}.
+  // Uncomment and change the ids to match your lines:
+  "send_pacing": {
+    "default":  { "min_sec": 3, "max_sec": 10 },
+    "per_line": {
+      // "Go1": { "min_sec": 5, "max_sec": 5  },   // fixed 5s between sends on Go1
+      // "Go2": { "min_sec": 1, "max_sec": 40 },   // random 1-40s on Go2
+      // "Go3": { "min_sec": 0, "max_sec": 0  }     // no pause on Go3 (back-to-back)
+    }
+  },
+
+  // Which lines to use for queue rows WITHOUT a line (line=NULL/''):
+  // empty [] = round-robin over all alive lines; or a list, e.g. ["Go1","Go3"].
+  "default_lines": [],
+
+  // ──────────────────────────────────────────────────────────────
+  //  BLOCK 5 · LOGS / DIAGNOSTICS
+  //  Logs goip-bridge.log + .err.log are written to the SAME folder as
+  //  this config file (next to the -config path). Values below are defaults.
+  // ──────────────────────────────────────────────────────────────
+
+  "debug": false,              // true = verbose per-SMS/USSD logging (numbers, text). Default false.
+  "log_max_mb": 10,            // size cap per log file (goip-bridge.log/.err.log) in MB.
+                               //   Default 10 (if unset/0). Grows fast with debug:true, then rotated to .1.
+
+  // true = one file per line, goip-bridge.line-<id>.log, with the full raw
+  // keepalive (PASSWORD, signal, IMEI/IMSI/ICCID, carrier, IP).
+  // Each file is capped at 3 MB (then rotated to .1). WARNING: holds passwords — local only.
+  "debug_line": false,
+
+  // A line is "dead" after this many seconds without keepalive (alive=false)
+  // and is skipped when sending. Default 120.
+  "line_dead_after_sec": 120,
+
+  // ──────────────────────────────────────────────────────────────
+  //  BLOCK 6 · MySQL (optional) — outbox queue + inbox table
+  //  Uncomment to enable. Without it the bridge works via the HTTP
+  //  API (Block 2) and/or webhook (Block 3) only.
+  // ──────────────────────────────────────────────────────────────
+  // "db": {
+  //   "host": "127.0.0.1",
+  //   "port": 3306,
+  //   "user": "goip_bridge",
+  //   "password": "CHANGE_ME",
+  //   "name": "goip_go",
+  //   "inbox_table": "goip_inbox",
+  //   "outbox_table": "goip_outbox",
+  //   "poll_sec": 3              // how often to poll the outbox for new messages (default 3)
+  // }
+
+  // ──────────────────────────────────────────────────────────────
+  //  BLOCK 7 · SENDING VIA THE MySQL QUEUE (Block 6; this is a comment)
+  //  HTTP examples (curl/PHP/Node) are above, in Block 2.
+  // ──────────────────────────────────────────────────────────────
+  //
+  //  Queue a message — just INSERT into outbox (the bridge picks it up). type='sms'|'ussd':
+  //    SMS on a specific line:
+  //      INSERT INTO goip_outbox (type, line, to_number, text, status)
+  //      VALUES ('sms', 'Go1', '+996700000001', 'Hello', 'queued');
+  //    SMS on any alive line (round-robin) — line = NULL:
+  //      INSERT INTO goip_outbox (type, line, to_number, text, status)
+  //      VALUES ('sms', NULL, '+996700000001', 'Hello', 'queued');
+  //    USSD (balance) — to_number = code, the reply lands in the reply column:
+  //      INSERT INTO goip_outbox (type, line, to_number, status)
+  //      VALUES ('ussd', 'Go1', '*100#', 'queued');
+  //    Statuses: queued -> sending -> sent->delivered (sms) | done (ussd) | failed | cancelled.
+}
+`

@@ -2,6 +2,44 @@
 
 Формат близок к [Keep a Changelog](https://keepachangelog.com/ru/1.0.0/), версии - SemVer.
 
+## [Unreleased]
+
+## [0.3.2] - 2026-06-11
+
+### Добавлено
+
+- Модульные тесты (`main_test.go`): разбор протокольных пакетов, дедупликация входящих, загрузка конфига и HTTP-обработчики.
+
+### Исправлено
+
+- Входящие SMS и delivery report во время переподключения к MySQL теперь попадают в fallback-журнал, а не теряются (раньше в окно reconnect они не писались ни в базу, ни в журнал).
+- Дедупликация входящих `RECEIVE`/`DELIVER` очищается по времени (~10 минут) независимо от нагрузки — устранён риск ложно отбросить новое сообщение после перезагрузки устройства с повтором номера пакета, а карта ключей больше не растёт без предела при всплеске трафика.
+- Логи: после неудачной ротации (нет места или прав) записи больше не уходят молча в уже закрытый файл.
+- Прямая отправка без MySQL (`/sms`, `/ussd`) сериализуется по линии — два параллельных запроса на одну SIM больше не накладываются (если линия занята, возвращается `409`).
+- Слишком длинный текст SMS или код USSD отклоняется с `400`, а не блокирует линию до истечения таймаута.
+- USSD-задания, прерванные аварийным завершением, больше не помечаются ложным временем отправки.
+- `/health` сообщает реальное состояние MySQL (быстрый ping), а не просто наличие настройки.
+- Некорректные (отрицательные) тайминги в конфиге заменяются значениями по умолчанию вместо аварийного завершения процесса.
+- Ошибка привязки HTTP-порта обрабатывается штатно, без обхода корректного завершения.
+- Сбой или паника при доставке webhook больше не могут уронить сервис или заблокировать очередь доставки.
+
+### Безопасность
+
+- Пароль линии очищается от управляющих символов (CR/LF) перед отправкой на устройство — выученный из keepalive пароль нельзя использовать для вставки лишней протокольной строки.
+- Подключение к MySQL собирается средствами драйвера (корректное экранирование спецсимволов в пароле) и получает таймауты, чтобы зависшая база не блокировала обработку.
+- HTTP-сервер получил таймауты чтения и простоя соединения (защита от медленных клиентов); запись ответа рассчитана так, чтобы не обрывать синхронную отправку.
+- `RECEIVE` без идентификатора линии отбрасывается; `sms_no` в delivery report проверяется как число перед сопоставлением со строкой в базе.
+- Предупреждение при старте, если приём UDP открыт (пустые `allow_src` и `line_passwords`) либо `http_token` пуст, слишком короткий или остался placeholder при не-loopback адресе.
+
+### Документация
+
+- Добавлен `CONFIG.md` - полный справочник по настройкам `config.json`, CLI-флагам, дефолтам, webhook retry, pacing, логам и MySQL-режиму.
+- Переписан `API.md` по фактическим handler-функциям: асинхронные `/sms` и `/ussd` при MySQL, `GET /status/{id}`, `DELETE /message/{id}`, webhook-события, retry и коды ошибок.
+- Возвращён минимальный `config.no-mysql.example.json` в каталог основного проекта.
+- Добавлен `LICENSE` с MIT License.
+- Подготовлены release artifacts: `goip-bridge-linux-amd64.tar.gz` и `checksums.txt` с SHA256 для бинарника и архива.
+- README, INSTALL, MYSQL, TROUBLESHOOTING, DOWNLOAD и SCHEMES синхронизированы с реальным поведением v0.3.1: `webhook_retry`, `send_pacing`, `default_lines`, `done`, `cancelled`, fallback-журнал и фактические сообщения MySQL reconnect.
+
 ## [0.3.1] - 2026-06-10
 
 ### Документация
@@ -63,7 +101,7 @@
 - Обновлены README, INSTALL, DOWNLOAD.
 - Добавлены API, MySQL и troubleshooting-инструкции.
 - Добавлен минимальный пример конфига без MySQL.
-- Уточнено фактическое поведение API: HTTP `200` при `status=failed`, непроверяемые HTTP-методы, выбор линии без гарантии порядка.
+- Уточнено фактическое поведение API: HTTP `200` при `status=failed`, непроверяемые HTTP-методы, выбор линии при пустом `line`.
 - Документированы `line_passwords`, webhook timeout 15 секунд, MySQL runtime-лимиты и формат `dlr_state:N`.
 
 ### Исправлено в dev tools
@@ -83,6 +121,51 @@
 ---
 
 ## English
+
+## [Unreleased]
+
+## [0.3.2] - 2026-06-11
+
+### Added
+
+- Unit tests (`main_test.go`): protocol packet parsing, inbound de-duplication, config loading and HTTP handlers.
+
+### Fixed
+
+- Inbound SMS and delivery reports during a MySQL reconnect now go to the fallback journal instead of being lost (previously, in the reconnect window, they were written neither to the database nor to the journal).
+- Inbound `RECEIVE`/`DELIVER` de-duplication is now purged on a time basis (~10 minutes) regardless of load — this removes the risk of falsely dropping a new message after a device reboot reuses a packet sequence number, and the key map no longer grows unbounded during a traffic burst.
+- Logs: after a failed rotation (no disk space or permissions) entries are no longer silently written to an already-closed file.
+- Direct send without MySQL (`/sms`, `/ussd`) is serialized per line — two concurrent requests to the same SIM no longer interleave (a busy line returns `409`).
+- Over-long SMS text or USSD code is rejected with `400` instead of blocking the line until timeout.
+- USSD jobs interrupted by a crash are no longer stamped with a false send time.
+- `/health` reports the live MySQL state (a quick ping) rather than just whether it is configured.
+- Invalid (negative) timing values in the config fall back to defaults instead of crashing the process.
+- An HTTP port-bind error is handled cleanly, without bypassing graceful shutdown.
+- A failure or panic during webhook delivery can no longer crash the service or stall the delivery queue.
+
+### Security
+
+- The line password is stripped of control characters (CR/LF) before being sent to the device — a password learned from keepalive can no longer be used to inject an extra protocol line.
+- The MySQL connection string is built by the driver (correct escaping of special characters in the password) and gets connection timeouts, so a hung database cannot block processing.
+- The HTTP server gained read and idle timeouts (slow-client protection); the response-write timeout is sized so it never cuts off a synchronous send.
+- A `RECEIVE` without a line id is dropped; the delivery-report `sms_no` is validated as a number before it is matched against a database row.
+- A startup warning is logged when UDP intake is open (empty `allow_src` and `line_passwords`) or when `http_token` is empty, too short, or left as the placeholder on a non-loopback address.
+
+### Documentation
+
+- Added `CONFIG.md`, a full reference for `config.json`, CLI flags, defaults,
+  webhook retry, pacing, logs and MySQL mode.
+- Rewrote `API.md` against the actual HTTP handlers: asynchronous `/sms` and
+  `/ussd` with MySQL, `GET /status/{id}`, `DELETE /message/{id}`, webhook
+  events, retry behavior and error codes.
+- Restored the minimal `config.no-mysql.example.json` in the main project
+  directory.
+- Added `LICENSE` with MIT License.
+- Prepared release artifacts: `goip-bridge-linux-amd64.tar.gz` and
+  `checksums.txt` with SHA256 sums for the binary and archive.
+- Synchronized README, INSTALL, MYSQL, TROUBLESHOOTING, DOWNLOAD and SCHEMES
+  with real v0.3.1 behavior: `webhook_retry`, `send_pacing`, `default_lines`,
+  `done`, `cancelled`, fallback journal and actual MySQL reconnect messages.
 
 ## [0.3.1] - 2026-06-10
 

@@ -4,8 +4,19 @@
   "http_token": "CHANGE_ME_TO_LONG_RANDOM_TOKEN",
   "webhook_url": "",
   "webhook_token": "",
+  "webhook_retry": { "max_hours": 3, "base_sec": 5 },
   "send_timeout_sec": 45,
   "ussd_timeout_sec": 120,
   "ussd_retransmit_sec": 60,
+  "send_pacing": {
+    "default": { "min_sec": 3, "max_sec": 10 },
+    "per_line": {}
+  },
+  "default_lines": [],
+  "debug": false,
+  "debug_line": false,
+  "log_max_mb": 10,
+  "line_dead_after_sec": 120,
+  "allow_src": [],
   "line_passwords": {}
 }

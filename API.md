@@ -1,35 +1,71 @@
-# HTTP API goip-bridge
+# goip-bridge HTTP API
 
-API нужен вашему приложению: CRM, боту, панели, биллингу, мониторингу или любому backend-сервису.
+`goip-bridge` gives your CRM, bot, billing panel, monitoring service or backend
+a simple HTTP interface for a physical GoIP DBL / Hybertone gateway.
 
-Базовый адрес в примерах:
+Base URL in examples:
 
 ```text
 http://127.0.0.1:8080
 ```
 
-Если в `config.json` указан `http_token`, каждый запрос должен содержать:
+If `http_token` is set in `config.json`, every endpoint except `/health` needs:
 
 ```text
 Authorization: Bearer CHANGE_ME_TO_LONG_RANDOM_TOKEN
 ```
 
-## Важное поведение
+## Important Behavior
 
-- HTTP-метод проверяется: на неправильный метод эндпоинт отвечает `405` с заголовком `Allow`. `/lines`, `/inbox`, `/health` — только `GET`; `/sms`, `/ussd` — только `POST`.
-- Ошибка отправки SMS на уровне GoIP не всегда означает HTTP-ошибку. Если запрос JSON корректный и линия найдена, `/sms` возвращает HTTP `200`, а результат нужно смотреть в поле `status`: `sent` или `failed`.
-- Если `line` пустой, bridge выбирает живую линию с наименьшим `id` (детерминированно, без учёта оператора и загрузки). Для предсказуемой маршрутизации указывайте конкретный `line`, например `Go1`.
-- Валидация тела: пустой `code` в `/ussd` → `400 need code`; пустые `to`/`text` в `/sms` → `400 need to + text`. Тело запроса ограничено 1 МБ.
+- `/health` is unauthenticated. All other API endpoints use the bearer token.
+- Request bodies for `/sms` and `/ussd` are limited to 1 MB.
+- HTTP methods are strict. A wrong method returns `405` and an `Allow` header.
+- Phone numbers for `/sms` must match `+` plus digits, or digits only, 3 to 20
+  digits total. Spaces, letters and punctuation are rejected.
+- Without MySQL, `/sms` and `/ussd` are synchronous: the HTTP response contains
+  the device result.
+- With MySQL configured, `/sms` and `/ussd` are asynchronous: the HTTP response
+  is `202 accepted`, and the result is available through `GET /status/{id}`,
+  webhook events and the database row.
+- In synchronous `/sms`, device-level send failure still returns HTTP `200` with
+  JSON `{"status":"failed"}`. Check the JSON status, not only the HTTP status.
+
+## GET /health
+
+Lightweight monitoring endpoint. It does not require `Authorization`.
+
+```sh
+curl http://127.0.0.1:8080/health
+```
+
+Example:
+
+```json
+{
+  "ok": true,
+  "lines": 8,
+  "alive": 7,
+  "db": true
+}
+```
+
+Fields:
+
+- `lines` - how many GoIP lines have ever registered since process start.
+- `alive` - how many lines are routable now: GSM status is `LOGIN` and recent
+  keepalive is within `line_dead_after_sec`.
+- `db` - whether MySQL is currently connected.
 
 ## GET /lines
 
-Показывает линии GoIP, которые прислали keepalive.
+Returns all GoIP lines known to the current process.
 
 ```sh
-curl -H "Authorization: Bearer CHANGE_ME_TO_LONG_RANDOM_TOKEN" http://127.0.0.1:8080/lines
+curl -H "Authorization: Bearer CHANGE_ME_TO_LONG_RANDOM_TOKEN" \
+  http://127.0.0.1:8080/lines
 ```
 
-Пример ответа:
+Example:
 
 ```json
 [
@@ -44,85 +80,55 @@ curl -H "Authorization: Bearer CHANGE_ME_TO_LONG_RANDOM_TOKEN" http://127.0.0.1:
     "iccid": "333",
     "carrier": "Operator",
     "alive": true,
-    "last_seen": "2026-06-09T18:00:00Z"
+    "last_seen": "2026-06-11T10:00:00Z"
   }
 ]
 ```
 
-Главные поля:
+Useful fields:
 
-- `id` - имя линии, его можно передавать в `/sms` и `/ussd`.
-- `alive` - можно ли сейчас использовать линию.
-- `gsm_status` - статус GSM-модуля; для рабочей линии обычно `LOGIN`.
-- `signal` - уровень сигнала, как его передал GoIP.
+- `id` - line id from GoIP **SMS Client ID**. Use it as `line` in `/sms`,
+  `/ussd` or `goip_outbox.line`.
+- `alive` - whether the bridge can route work to this line now.
+- `signal`, `gsm_status`, `imei`, `imsi`, `iccid`, `carrier` - values received
+  from GoIP keepalive.
 
-## GET /health
+## POST /sms Without MySQL
 
-Лёгкий эндпоинт для мониторинга. **Не требует токена** (рассчитан на localhost-проверки).
-
-```sh
-curl http://127.0.0.1:8080/health
-```
-
-Пример ответа:
-
-```json
-{
-  "ok": true,
-  "lines": 8,
-  "alive": 8,
-  "db": true
-}
-```
-
-- `lines` - сколько линий зарегистрировано (прислали keepalive).
-- `alive` - сколько из них сейчас в строю (`alive: true`).
-- `db` - подключён ли MySQL (только если режим БД включён в конфиге).
-
-## POST /sms
-
-Отправляет SMS через GoIP.
+When the `db` block is absent, `/sms` sends directly and waits for the GoIP
+send handshake.
 
 ```sh
 curl -X POST http://127.0.0.1:8080/sms \
   -H "Authorization: Bearer CHANGE_ME_TO_LONG_RANDOM_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"line":"Go1","to":"996700000001","text":"Test message"}'
+  -d '{"line":"Go1","to":"+996700000001","text":"Test message"}'
 ```
 
-Тело запроса:
+Request:
 
 ```json
 {
   "line": "Go1",
-  "to": "996700000001",
+  "to": "+996700000001",
   "text": "Test message"
 }
 ```
 
-`line` можно оставить пустым:
+`line` may be empty. In no-MySQL synchronous mode the bridge then selects the
+alive line with the lowest id. For predictable routing, pass the line explicitly.
 
-```json
-{
-  "line": "",
-  "to": "996700000001",
-  "text": "Test message"
-}
-```
-
-Тогда bridge выберет живую линию с наименьшим `id` (детерминированно, без учёта оператора и загрузки). Для production лучше указывать `line` явно.
-
-Успешный ответ:
+Success:
 
 ```json
 {
   "line": "Go1",
-  "sms_no": "123",
-  "status": "sent"
+  "status": "sent",
+  "sms_no": "123"
 }
 ```
 
-Ошибка отправки от устройства:
+Device-level failure:
 
 ```json
 {
@@ -132,19 +138,48 @@ curl -X POST http://127.0.0.1:8080/sms \
 }
 ```
 
-Такой ответ приходит с HTTP `200`. Клиент должен проверять `status`, а не только HTTP-код.
+That failure response uses HTTP `200` because the API request itself was valid.
+Your client must check `status`.
 
-Если нет живой линии:
+## POST /sms With MySQL
+
+When the `db` block is present and MySQL is connected, `/sms` inserts a row into
+`goip_outbox` and returns immediately.
 
 ```json
 {
-  "error": "no alive line"
+  "status": "accepted",
+  "id": "1781140000000000-abcdef...",
+  "queued_at": 1781140000000000
 }
 ```
 
-## POST /ussd
+Use the returned `id` with:
 
-Выполняет USSD-команду, например запрос баланса.
+```sh
+curl -H "Authorization: Bearer CHANGE_ME_TO_LONG_RANDOM_TOKEN" \
+  http://127.0.0.1:8080/status/1781140000000000-abcdef
+```
+
+If MySQL is configured but temporarily disconnected, `/sms` returns:
+
+```json
+{
+  "error": "queue temporarily unavailable (db reconnecting)"
+}
+```
+
+with HTTP `503`. The bridge keeps reconnecting to MySQL in the background.
+
+Routing in queue mode:
+
+- request `line:"Go1"` becomes `goip_outbox.line='Go1'`;
+- empty `line` becomes SQL `NULL`;
+- SQL `NULL` or empty line is routed by the scheduler using `default_lines`, or
+  all alive lines if `default_lines` is empty;
+- queue mode keeps one SMS/USSD in flight per line and applies `send_pacing`.
+
+## POST /ussd Without MySQL
 
 ```sh
 curl -X POST http://127.0.0.1:8080/ussd \
@@ -153,16 +188,7 @@ curl -X POST http://127.0.0.1:8080/ussd \
   -d '{"line":"Go1","code":"*100#"}'
 ```
 
-Тело запроса:
-
-```json
-{
-  "line": "Go1",
-  "code": "*100#"
-}
-```
-
-Успешный ответ:
+Success:
 
 ```json
 {
@@ -171,7 +197,7 @@ curl -X POST http://127.0.0.1:8080/ussd \
 }
 ```
 
-Если оператор или устройство не ответили:
+Timeout or device error:
 
 ```json
 {
@@ -180,17 +206,149 @@ curl -X POST http://127.0.0.1:8080/ussd \
 }
 ```
 
-Если `code` пустой, bridge отвечает `400 need code` и ничего не отправляет устройству.
+If `line` is empty in no-MySQL mode, the bridge selects the alive line with the
+lowest id.
+
+## POST /ussd With MySQL
+
+With MySQL enabled, `/ussd` is also asynchronous. The USSD code is stored in
+`goip_outbox.to_number` with `type='ussd'`.
+
+Accepted response:
+
+```json
+{
+  "status": "accepted",
+  "id": "1781140000000000-abcdef...",
+  "queued_at": 1781140000000000
+}
+```
+
+The final result appears in `GET /status/{id}`, webhook event `done` or `failed`,
+and the SQL row fields `status`, `reply` and `error_code`.
+
+## GET /status/{id}
+
+Available only when MySQL is enabled and connected. Returns queue state for the
+public `guid` returned by `/sms` or `/ussd`.
+
+```sh
+curl -H "Authorization: Bearer CHANGE_ME_TO_LONG_RANDOM_TOKEN" \
+  http://127.0.0.1:8080/status/1781140000000000-abcdef
+```
+
+Queued example:
+
+```json
+{
+  "id": "1781140000000000-abcdef",
+  "status": "queued",
+  "type": "sms",
+  "line": "",
+  "to": "+996700000001",
+  "text": "Test message",
+  "queued_at": "2026-06-11T10:00:00Z",
+  "position": 3,
+  "before": 2,
+  "after": 10
+}
+```
+
+Sent SMS example:
+
+```json
+{
+  "id": "1781140000000000-abcdef",
+  "status": "sent",
+  "type": "sms",
+  "line": "Go1",
+  "to": "+996700000001",
+  "text": "Test message",
+  "sms_no": 123,
+  "queued_at": "2026-06-11T10:00:00Z",
+  "channel": {
+    "line": "Go1",
+    "alive": true,
+    "last_seen_ago_sec": 4,
+    "recent_sends": 12,
+    "recent_fail_streak": 0,
+    "suspect": false
+  }
+}
+```
+
+USSD done example:
+
+```json
+{
+  "id": "1781140000000000-abcdef",
+  "status": "done",
+  "type": "ussd",
+  "line": "Go1",
+  "to": "*100#",
+  "reply": "Balance: 42.00",
+  "channel": {
+    "line": "Go1",
+    "alive": true,
+    "last_seen_ago_sec": 4,
+    "recent_sends": 3,
+    "recent_fail_streak": 0,
+    "suspect": false
+  }
+}
+```
+
+Errors:
+
+- `400 need id` - missing id after `/status/`.
+- `404 no queue (db off)` - MySQL mode is off or not connected.
+- `404 not found` - no row with that `guid`.
+- `500 db` - database query failed.
+
+## DELETE /message/{id}
+
+Cancels a message only while it is still `queued`.
+
+```sh
+curl -X DELETE \
+  -H "Authorization: Bearer CHANGE_ME_TO_LONG_RANDOM_TOKEN" \
+  http://127.0.0.1:8080/message/1781140000000000-abcdef
+```
+
+Success:
+
+```json
+{
+  "id": "1781140000000000-abcdef",
+  "status": "cancelled"
+}
+```
+
+Too late:
+
+```json
+{
+  "error": "too late",
+  "status": "sending"
+}
+```
+
+Errors:
+
+- `404 no queue (db off)` - MySQL mode is off or not connected.
+- `404 not found` - unknown id.
+- `409 too late` - row already moved past `queued`.
 
 ## GET /inbox
 
-Возвращает последние входящие SMS, которые bridge держит в памяти.
+Returns the last 500 inbound SMS kept in process memory.
 
 ```sh
-curl -H "Authorization: Bearer CHANGE_ME_TO_LONG_RANDOM_TOKEN" http://127.0.0.1:8080/inbox
+curl -H "Authorization: Bearer CHANGE_ME_TO_LONG_RANDOM_TOKEN" \
+  http://127.0.0.1:8080/inbox
 ```
 
-Пример ответа:
+Example:
 
 ```json
 [
@@ -198,34 +356,36 @@ curl -H "Authorization: Bearer CHANGE_ME_TO_LONG_RANDOM_TOKEN" http://127.0.0.1:
     "line": "Go1",
     "from": "+996555111222",
     "text": "Incoming message",
-    "time": "2026-06-09T18:00:00Z"
+    "time": "2026-06-11T10:00:00Z"
   }
 ]
 ```
 
-Важно: `/inbox` хранит максимум 500 сообщений и очищается после перезапуска. Для постоянного хранения используйте MySQL-режим: [MYSQL.md](MYSQL.md)
+Important: this is memory only. It is cleared on process restart. Use MySQL
+mode for persistent inbound SMS storage.
 
 ## Webhook
 
-Если в `config.json` указан `webhook_url`, bridge отправляет туда HTTP `POST`.
-
-Конфиг:
+If `webhook_url` is set, the bridge sends JSON events to your service:
 
 ```json
 {
   "webhook_url": "https://example.com/goip-webhook",
-  "webhook_token": "WEBHOOK_SECRET"
+  "webhook_token": "WEBHOOK_SECRET",
+  "webhook_retry": { "max_hours": 3, "base_sec": 5 }
 }
 ```
 
-Заголовки:
+Headers:
 
 ```text
 Content-Type: application/json
 Authorization: Bearer WEBHOOK_SECRET
 ```
 
-Входящая SMS:
+The `Authorization` header is sent only when `webhook_token` is not empty.
+
+### Inbound SMS Event
 
 ```json
 {
@@ -233,13 +393,14 @@ Authorization: Bearer WEBHOOK_SECRET
   "line": "Go1",
   "from": "+996555111222",
   "text": "Message text",
-  "time": "2026-06-09T18:00:00Z"
+  "time": "2026-06-11T10:00:00Z"
 }
 ```
 
-Номер отправителя берется из GoIP-пакета по первому найденному полю в таком порядке: `srcnum`, `num`, `src`, `sender`.
+The sender number is taken from the first GoIP field found in this order:
+`srcnum`, `num`, `src`, `sender`.
 
-Delivery report:
+### Delivery Report Event
 
 ```json
 {
@@ -247,37 +408,137 @@ Delivery report:
   "line": "Go1",
   "sms_no": "123",
   "state": "0",
-  "time": "2026-06-09T18:00:00Z"
+  "time": "2026-06-11T10:00:00Z"
 }
 ```
 
-В GoIP-протоколе `state: "0"` обычно означает доставку. Другие значения bridge передает как есть.
+In GoIP protocol, `state: "0"` means delivered. Other values are passed through
+and, in MySQL mode, become `failed` with `error_code='dlr_state:<state>'`.
 
-Webhook отправляется HTTP-клиентом с timeout 15 секунд. Если webhook недоступен или отвечает слишком долго, bridge пишет ошибку в лог и не делает повторную доставку webhook-события. Одновременно в полёте держится не больше 16 webhook-запросов; при перегрузке лишние события отбрасываются с записью в лог (источник истины — MySQL и `/inbox`, а не webhook).
+### Queue Events
 
-## Коды ошибок HTTP
+`queued`:
 
-- `401 unauthorized` - нет bearer-токена или токен неправильный.
-- `400 bad json` - тело запроса не является JSON (или больше 1 МБ).
-- `400 need to + text` - в `/sms` не переданы `to` или `text`.
-- `400 need code` - в `/ussd` не передан `code`.
-- `404 no alive line` - указанная линия не жива или нет ни одной живой линии.
-- `405 method not allowed` - неверный HTTP-метод для эндпоинта (см. заголовок `Allow`).
-- `500 ussd timeout` или `ussd error` - ошибка USSD-сессии.
-- `200` со `status: "failed"` в `/sms` - запрос обработан, но устройство не подтвердило отправку. Причина лежит в поле `error`.
-
-Практическое правило для клиента:
-
-```text
-HTTP != 2xx        -> transport/API error
-/sms status=sent   -> SMS принята GoIP
-/sms status=failed -> SMS не отправлена, смотреть error
-/ussd reply        -> USSD-ответ получен
-/ussd error        -> USSD не выполнен
+```json
+{
+  "type": "queued",
+  "id": "1781140000000000-abcdef",
+  "msg_type": "sms",
+  "line": "Go1",
+  "to": "+996700000001",
+  "time": "2026-06-11T10:00:00Z",
+  "channel": {
+    "line": "Go1",
+    "alive": true,
+    "last_seen_ago_sec": 2,
+    "recent_sends": 5,
+    "recent_fail_streak": 0,
+    "suspect": false
+  }
+}
 ```
 
-## Безопасность
+SMS `sent`:
 
-- Не оставляйте `http_token` пустым на сервере, доступном из сети.
-- Не публикуйте API напрямую в интернет без VPN, firewall или reverse proxy.
-- Логи могут содержать номера телефонов и текст SMS. Ограничьте доступ к серверу.
+```json
+{
+  "type": "sent",
+  "id": "1781140000000000-abcdef",
+  "msg_type": "sms",
+  "line": "Go1",
+  "sms_no": "123",
+  "channel": {
+    "line": "Go1",
+    "alive": true,
+    "last_seen_ago_sec": 2,
+    "recent_sends": 5,
+    "recent_fail_streak": 0,
+    "suspect": false
+  },
+  "time": "2026-06-11T10:00:00Z"
+}
+```
+
+USSD `done`:
+
+```json
+{
+  "type": "done",
+  "id": "1781140000000000-abcdef",
+  "msg_type": "ussd",
+  "line": "Go1",
+  "reply": "Balance: 42.00",
+  "channel": {
+    "line": "Go1",
+    "alive": true,
+    "last_seen_ago_sec": 2,
+    "recent_sends": 5,
+    "recent_fail_streak": 0,
+    "suspect": false
+  },
+  "time": "2026-06-11T10:00:00Z"
+}
+```
+
+Failure:
+
+```json
+{
+  "type": "failed",
+  "id": "1781140000000000-abcdef",
+  "msg_type": "sms",
+  "line": "Go1",
+  "error": "timeout",
+  "channel": {
+    "line": "Go1",
+    "alive": true,
+    "last_seen_ago_sec": 2,
+    "recent_sends": 10,
+    "recent_fail_streak": 10,
+    "suspect": true,
+    "suspect_reason": "10 sends in a row failed — possible ban or no balance"
+  },
+  "time": "2026-06-11T10:00:00Z"
+}
+```
+
+### Webhook Retry
+
+Webhook delivery is reliable within the configured in-memory retry window:
+
+- HTTP client timeout: 15 seconds.
+- Success: any HTTP `2xx`.
+- Failure: network error, timeout or non-2xx response.
+- Retry delay: `base_sec`, then doubled on each failed attempt.
+- Maximum age: `webhook_retry.max_hours`.
+- Queue capacity: 10,000 pending events.
+- Delivery concurrency: 16 in-flight webhook requests.
+
+When a webhook event expires, the queue is full, or the process shuts down with
+pending webhook events, the event is written to `goip-bridge.fallback.jsonl`
+next to the config file. The bridge does not replay this file automatically.
+
+## HTTP Error Summary
+
+| Status | Example body | Meaning |
+|---:|---|---|
+| `400` | `{"error":"bad json"}` | Invalid JSON body or body too large. |
+| `400` | `{"error":"need to + text"}` | `/sms` missing recipient or text. |
+| `400` | `{"error":"bad number"}` | Recipient number failed validation. |
+| `400` | `{"error":"need code"}` | `/ussd` missing USSD code. |
+| `401` | `{"error":"unauthorized"}` | Missing or wrong bearer token. |
+| `404` | `{"error":"no alive line"}` | Requested line is not alive, or no alive line exists. |
+| `404` | `{"error":"no queue (db off)"}` | `/status` or `/message` used while MySQL queue is unavailable. |
+| `405` | `{"error":"method not allowed"}` | Wrong HTTP method. |
+| `409` | `{"error":"too late","status":"sending"}` | Cancellation was requested after the row left `queued`. |
+| `500` | `{"error":"enqueue failed"}` | Insert into MySQL queue failed. |
+| `503` | `{"error":"queue temporarily unavailable (db reconnecting)"}` | MySQL is configured but disconnected. |
+
+## Security Notes
+
+- Keep `listen_http` on `127.0.0.1:8080` unless another host really needs API
+  access.
+- Use a strong `http_token` if the API is reachable over the network.
+- Restrict network access with firewall, VPN or reverse proxy.
+- Logs, `/inbox`, MySQL rows and fallback files may contain phone numbers and
+  SMS text.

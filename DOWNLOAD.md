@@ -7,7 +7,7 @@
 ## Самая короткая инструкция
 
 1. Откройте страницу релизов: <https://github.com/e-u-shapovalov/goip-bridge/releases>
-2. Нажмите последний релиз, сейчас это **v0.3.1**.
+2. Нажмите последний релиз, сейчас это **v0.3.2**.
 3. Найдите блок **Assets**.
 4. Скачайте файл **`goip-bridge`**.
 5. Не скачивайте `Source code (zip)` и `Source code (tar.gz)`.
@@ -81,6 +81,12 @@ ls -lh goip-bridge
 Создайте рядом файл `config.json`:
 
 ```sh
+./goip-bridge -config config.json -init ru
+```
+
+Если хотите создать минимальный файл вручную:
+
+```sh
 nano config.json
 ```
 
@@ -108,13 +114,14 @@ nano config.json
 ./goip-bridge -config config.json
 ```
 
-Если видите такие строки, программа стартовала. Первая строка показывает версию, которая запустилась:
+Если видите такие строки, программа стартовала. Вторая строка показывает версию, которая запустилась:
 
 ```text
-goip-bridge v0.3.1 — GoIP SMS/USSD gateway. Copyright (c) 2026 Evgenii Shapovalov
-logging to /opt/goip-bridge (goip-bridge.log + .err.log, cap 10 MB, debug=false)
-goip-bridge listening on UDP :44444 (GoIP lines register here)
-HTTP API on 127.0.0.1:8080
+https://github.com/e-u-shapovalov/goip-bridge
+(c) Evgenii Shapovalov 2026 v0.3.2
+2026/06/11 10:00:00 logging to /opt/goip-bridge (goip-bridge.log + .err.log, cap 10 MB, debug=false debug_line=false)
+2026/06/11 10:00:00 goip-bridge listening on UDP :44444 (GoIP lines register here)
+2026/06/11 10:00:00 HTTP API on 127.0.0.1:8080
 ```
 
 ## Что настроить в GoIP

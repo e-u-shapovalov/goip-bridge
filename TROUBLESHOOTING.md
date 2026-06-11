@@ -253,13 +253,17 @@ curl -i https://example.com/goip-webhook
 
 Bridge отправляет `POST` с `Content-Type: application/json`.
 
-Webhook timeout в текущей версии - 15 секунд. Если принимающая сторона не ответила за это время, bridge пишет `webhook error` в лог и не повторяет отправку события.
+Webhook timeout в текущей версии - 15 секунд. Если принимающая сторона не ответила за это время, вернула не-2xx или недоступна, bridge не выбрасывает событие сразу: он держит его в памяти и повторяет с растущей паузой по настройке `webhook_retry` (`base_sec`, затем x2) до `max_hours`. Если очередь переполнена, событие устарело или процесс завершается с ожидающими webhook, запись попадает в `goip-bridge.fallback.jsonl`.
 
-## Проблема: `WARNING: MySQL connect failed, retrying in background`
+## Проблема: `queue temporarily unavailable (db reconnecting)`
 
-В `config.json` есть блок `db`, но подключение не удалось.
+В `config.json` есть блок `db`, но MySQL/MariaDB сейчас не подключена. В логах рядом будет строка вида:
 
-Bridge продолжит работать без MySQL (HTTP API и webhook останутся доступны) и будет повторять подключение к базе каждые 15 секунд в фоне. Как только доступ восстановится, в логе появится `MySQL connected (after retry)` - перезапуск не нужен.
+```text
+db: configured but NOT connected (...): ... — retrying in background; /sms and /ussd return 503 until connected
+```
+
+Bridge повторяет подключение к базе каждые 15 секунд в фоне. Пока база недоступна, `/sms` и `/ussd` в режиме очереди возвращают HTTP `503`, чтобы не отправить сообщение мимо MySQL. `/lines`, `/health`, UDP-приём от GoIP и webhook для входящих событий продолжают работать. Как только доступ восстановится, в логе появится `MySQL connected (after retry)` - перезапуск не нужен.
 
 Пока база недоступна, входящие SMS, статусы отправки и delivery report, которые не удалось записать, дописываются в `goip-bridge.fallback.jsonl` рядом с конфигом (см. [MYSQL.md](MYSQL.md)) - чтобы данные не потерялись молча.
 
@@ -347,7 +351,7 @@ chmod +x goip-bridge
 
 Не отправляйте пароли и токены. Полезная информация:
 
-- версия релиза, например `v0.2.0`;
+- версия релиза, например `v0.3.1` из `./goip-bridge -version`;
 - модель GoIP и прошивка;
 - фрагмент `config.json` без секретов;
 - вывод `GET /lines`;
