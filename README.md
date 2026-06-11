@@ -586,11 +586,34 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now goip-bridge
 ```
 
-Логи:
+### Управление службой
 
 ```sh
-sudo journalctl -u goip-bridge -f
+sudo systemctl status goip-bridge    # состояние: active/failed, PID, последние строки лога
+sudo systemctl restart goip-bridge   # перезапуск (например, после правки config.json)
+sudo systemctl stop goip-bridge      # остановить
+sudo systemctl start goip-bridge     # запустить
 ```
+
+### Логи службы
+
+Журнал systemd:
+
+```sh
+sudo journalctl -u goip-bridge -f                  # хвост вживую (Ctrl+C - выйти)
+sudo journalctl -u goip-bridge -n 100 --no-pager   # последние 100 строк
+sudo journalctl -u goip-bridge --since "10 min ago" --no-pager
+sudo journalctl -u goip-bridge --since today | grep -i webhook
+```
+
+Файловые логи - bridge параллельно пишет их рядом с конфигом (права `0600`, поэтому под root):
+
+```sh
+sudo tail -f /opt/goip-bridge/goip-bridge.log       # всё то же, что в journalctl
+sudo tail -50 /opt/goip-bridge/goip-bridge.err.log  # только ошибки и WARN
+```
+
+Содержимое одинаковое - пользуйтесь тем, что удобнее. `.err.log` - сигнальный: туда попадают только проблемы (`webhook OK` туда не пишется), поэтому «что сломалось» начинайте с него. `goip-bridge.log.prev` - лог прошлого запуска (см. `clear_logs_on_start`). Подробный лог каждой SMS/USSD включается опцией `"debug": true`.
 
 Подробная установка: [INSTALL.md](INSTALL.md)
 

@@ -151,6 +151,33 @@ sudo systemctl status goip-bridge
 sudo journalctl -u goip-bridge -f
 ```
 
+### Managing the service and logs
+
+```sh
+sudo systemctl status goip-bridge    # state: active/failed, PID, last log lines
+sudo systemctl restart goip-bridge   # restart (e.g. after editing config.json)
+sudo systemctl stop goip-bridge      # stop
+sudo systemctl start goip-bridge     # start
+```
+
+The systemd journal:
+
+```sh
+sudo journalctl -u goip-bridge -f                  # live tail (Ctrl+C to exit)
+sudo journalctl -u goip-bridge -n 100 --no-pager   # last 100 lines
+sudo journalctl -u goip-bridge --since "10 min ago" --no-pager
+sudo journalctl -u goip-bridge --since today | grep -i webhook
+```
+
+File logs - the bridge also writes them next to the config (mode `0600`, so use root):
+
+```sh
+sudo tail -f /opt/goip-bridge/goip-bridge.log       # same content as journalctl
+sudo tail -50 /opt/goip-bridge/goip-bridge.err.log  # errors and WARN only
+```
+
+The content is the same - use whichever is convenient. `.err.log` is the signal file: only problems land there (`webhook OK` is not written to it), so start with it when something is broken. `goip-bridge.log.prev` is the previous run's log (see `clear_logs_on_start`). Verbose per-SMS/USSD logging is enabled with `"debug": true`.
+
 ### Updating the version
 
 On an update only the binary changes; `config.json` stays in place.
