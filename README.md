@@ -433,12 +433,12 @@ chmod +x goip-bridge
 В логе должны появиться строки примерно такого вида. Первой идёт рамка-«шапка»: она показывает название, версию и копирайт того бинарника, который реально запустился.
 
 ```text
-+------------------------------------------------+
-| goip-bridge v0.4.0                             |
-| GoIP SMS/USSD gateway                          |
-| (c) Evgenii Shapovalov 2026                    |
-| https://github.com/e-u-shapovalov/goip-bridge  |
-+------------------------------------------------+
++-----------------------------------------------+
+| goip-bridge v0.4.0                            |
+| GoIP SMS/USSD gateway                         |
+| (c) Evgenii Shapovalov 2026                   |
+| https://github.com/e-u-shapovalov/goip-bridge |
++-----------------------------------------------+
 2026/06/12 10:00:00 logging to /opt/goip-bridge (goip-bridge.log + .err.log, cap 10 MB, debug=false debug_line=false clear_logs_on_start=true)
 2026/06/12 10:00:00 проверка обновлений отключена
 2026/06/12 10:00:00 goip-bridge listening on UDP :44444 (GoIP lines register here)

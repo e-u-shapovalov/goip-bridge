@@ -117,12 +117,12 @@ nano config.json
 Если видите такие строки, программа стартовала. Рамка в начале показывает версию, которая запустилась:
 
 ```text
-+------------------------------------------------+
-| goip-bridge v0.4.0                             |
-| GoIP SMS/USSD gateway                          |
-| (c) Evgenii Shapovalov 2026                    |
-| https://github.com/e-u-shapovalov/goip-bridge  |
-+------------------------------------------------+
++-----------------------------------------------+
+| goip-bridge v0.4.0                            |
+| GoIP SMS/USSD gateway                         |
+| (c) Evgenii Shapovalov 2026                   |
+| https://github.com/e-u-shapovalov/goip-bridge |
++-----------------------------------------------+
 2026/06/12 10:00:00 logging to /opt/goip-bridge (goip-bridge.log + .err.log, cap 10 MB, debug=false debug_line=false clear_logs_on_start=true)
 2026/06/12 10:00:00 goip-bridge listening on UDP :44444 (GoIP lines register here)
 2026/06/12 10:00:00 HTTP API on 127.0.0.1:8080
