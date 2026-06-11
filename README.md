@@ -7,7 +7,7 @@
 Создайте папку и скачайте последний релиз:
 
 ```sh
-sudo install -d -m 755 /opt/goip-bridge
+sudo mkdir -p /opt/goip-bridge
 cd /opt/goip-bridge
 sudo curl -L -o goip-bridge https://github.com/e-u-shapovalov/goip-bridge/releases/latest/download/goip-bridge
 sudo chmod +x goip-bridge
