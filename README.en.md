@@ -193,6 +193,12 @@ Create the database, user and tables:
 sudo mysql < mysql.schema.sql
 ```
 
+If you get `ERROR 1045 (28000): Access denied for user 'root'`, the MySQL root user has a password (passwordless socket auth is not available). Run it with a password prompt, or apply the schema as any MySQL admin user, for example via phpMyAdmin:
+
+```sh
+mysql -u root -p < mysql.schema.sql
+```
+
 This creates the `goip_go` database, the `goip_bridge@127.0.0.1` user and the `goip_inbox` and `goip_outbox` tables.
 
 The schema gives the user a placeholder password `CHANGE_ME_STRONG_DB_PASSWORD`. Replace it with your own:

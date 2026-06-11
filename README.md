@@ -191,6 +191,12 @@ sudo curl -L -o mysql.schema.sql https://raw.githubusercontent.com/e-u-shapovalo
 sudo mysql < mysql.schema.sql
 ```
 
+Если в ответ `ERROR 1045 (28000): Access denied for user 'root'`, значит у MySQL-root задан пароль (сокетная авторизация без пароля недоступна). Запустите с вводом пароля или примените схему любым админ-пользователем MySQL, например через phpMyAdmin:
+
+```sh
+mysql -u root -p < mysql.schema.sql
+```
+
 Команда создаёт базу `goip_go`, пользователя `goip_bridge@127.0.0.1` и таблицы `goip_inbox` и `goip_outbox`.
 
 Схема выдаёт пользователю временный пароль `CHANGE_ME_STRONG_DB_PASSWORD`. Замените его на свой:
