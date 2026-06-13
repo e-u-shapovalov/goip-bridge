@@ -7,7 +7,7 @@
 ## Самая короткая инструкция
 
 1. Откройте страницу релизов: <https://github.com/e-u-shapovalov/goip-bridge/releases>
-2. Нажмите последний релиз, сейчас это **v0.4.0**.
+2. Нажмите последний релиз, сейчас это **v0.5.0**.
 3. Найдите блок **Assets**.
 4. Скачайте файл **`goip-bridge`**.
 5. Не скачивайте `Source code (zip)` и `Source code (tar.gz)`.
@@ -118,7 +118,7 @@ nano config.json
 
 ```text
 +-----------------------------------------------+
-| goip-bridge v0.4.0                            |
+| goip-bridge v0.5.0                            |
 | GoIP SMS/USSD gateway                         |
 | (c) Evgenii Shapovalov 2026                   |
 | https://github.com/e-u-shapovalov/goip-bridge |

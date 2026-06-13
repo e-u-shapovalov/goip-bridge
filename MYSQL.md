@@ -269,7 +269,7 @@ ALTER TABLE goip_inbox  CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode
 | `id` | `BIGINT UNSIGNED` | MySQL | Авто-ID задания на отправку |
 | `guid` | `VARCHAR(64) NULL` | bridge (или ваше приложение) | Публичный id для `/status` и `/message`. Можно не задавать — bridge присвоит при заборе строки |
 | `line` | `VARCHAR(64) NULL` | ваше приложение / bridge | Линия GoIP. `NULL` или пусто = любая живая линия, порядок выбора не гарантирован |
-| `type` | `VARCHAR(8)` | ваше приложение | `sms` (по умолчанию) или `ussd` |
+| `type` | `VARCHAR(8)` | ваше приложение | `sms` (по умолчанию), `ussd` или `cmd` (управляющая команда status/reset — см. раздел ниже) |
 | `to_number` | `VARCHAR(64)` | ваше приложение | Номер получателя (SMS) либо USSD-код, напр. `*100#` (USSD) |
 | `text` | `TEXT NULL` | ваше приложение | Текст SMS (`NULL` для USSD) |
 | `status` | `ENUM(...)` | ваше приложение / bridge | Текущий статус очереди |
@@ -295,11 +295,16 @@ ALTER TABLE goip_inbox  CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode
 Формат `error_code`:
 
 - `timeout` - GoIP не завершил отправку за `send_timeout_sec`;
-- `errorstatus:N` или похожий текст от GoIP - устройство вернуло ошибку отправки;
-- `dlr_state:N` - SMS была отправлена, но delivery report пришел с состоянием не `0`;
+- `errorstatus:N — <описание>` - устройство вернуло ошибку отправки (`+CMS ERROR` модема Quectel M35).
+  Описание подставляется, если код известен, напр. `errorstatus:38 — Network out of order`; `500` обычно =
+  слабый сигнал / нет баланса. Значение по-прежнему начинается с `errorstatus:N`, так что старый парсинг не ломается;
+- `dlr_state:N — <описание>` - SMS отправлена, но DLR пришёл с состоянием ≠ `0` (TP-Status GSM 03.40), напр. `dlr_state:70 — SM validity period expired (permanent)`;
 - `bad_number` - номер получателя не прошёл проверку (разрешены `+` и 3-20 цифр);
 - `no_address` - для линии ещё не было keepalive, адрес устройства неизвестен;
+- `bad_type` - в `type` не `sms`/`ussd`/`cmd`; `unknown_cmd:<X>` - неизвестная команда в `cmd`-строке;
 - другие строки - подробность из UDP-протокола GoIP.
+
+В вебхуке и в HTTP-ответе описание приходит ОТДЕЛЬНЫМ полем `error_desc` (для DLR — `state_desc`), а сырой код остаётся в `error`/`state`. Таблицы кодов — в `main.go` (`cmsErrorText`, `tpStatusText`).
 
 Отдельные случаи, когда строка НЕ помечается `failed`:
 

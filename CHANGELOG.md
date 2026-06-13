@@ -4,6 +4,37 @@
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-06-14
+
+### Добавлено
+
+- Управляющие команды `status` и `reset` - через MySQL-очередь (`type='cmd'`, `to_number='status'|'reset'` в `goip_outbox`) и через HTTP (`POST /stats`, `POST /reset`). Ответ одинаков на обоих путях: одна JSON-строка в таблице входящих (`line='system'`, `from_number='goip-bridge'`) плюс тот же body в webhook (`type:"stat"`); HTTP дополнительно возвращает его в ответе.
+- Команда `status`: версия, аптайм, память процесса и системная (`/proc/meminfo` на Linux), состояние каждой линии (alive, сигнал, `gsm_status`, оператор, номер) и счётчики очереди по статусам.
+- Команда `reset`: мягкий сброс без перезапуска сервиса - отменяет все строки `queued` в outbox (статус `cancelled`; у пользователя БД нет права DELETE, поэтому строки не удаляются, история сохраняется) и сбрасывает кеши в ОЗУ (дедуп входящих, здоровье и `suspect` линий, паузы pacing). Не трогает активные отправки, неотправленную очередь webhook и реестр линий.
+- Описание кодов ошибок: `errorstatus:N` (`+CMS ERROR` модема) и `dlr_state:N` (TP-Status по GSM 03.40) сопровождаются человекочитаемым текстом - он дописывается в колонку `error_code` (`errorstatus:38 — Network out of order`, обратная совместимость сохранена) и приходит отдельным полем `error_desc`/`state_desc` в webhook и HTTP-ответах.
+
+### Изменено
+
+- Таймаут штатной остановки HTTP-сервера теперь равен `max(send_timeout_sec, ussd_timeout_sec)`: долгий синхронный `/ussd` больше не обрывается на середине при остановке.
+- Строки очереди проверяются ДО захвата линии (номер получателя, непустой текст, длина текста, набор символов USSD-кода): негодная строка сразу помечается `failed`, а не занимает линию на весь таймаут отправки.
+- Входящие RECEIVE/DELIVER: длина id линии ограничена 64 символами (как колонка в БД), `seq` - 32; пакеты с превышением отбрасываются. Недоверенные `line`/`from` логируются в кавычках - защита от подделки строк лога.
+
+### Исправлено
+
+- Падение при ротации лога на заполненном диске: внутренний writer логов больше не разыменовывает nil после неудачного повторного открытия файла.
+- `-update`: резервная копия бинарника удаляется только после подтверждённого `systemctl restart` (раньше - до; при сбое рестарта откат был невозможен).
+- После аварийного перезапуска прерванные команды (`cmd`) и USSD больше не запускаются повторно (помечаются `failed` для разбора); повторно в очередь ставится только SMS.
+- Команда диагностики защищена от паники и дожидается завершения при остановке: ошибка внутри неё больше не роняет сервис.
+- Фоновые записи в БД (входящее SMS, обновление статуса доставки, ответ команды) дожидаются завершения при остановке до закрытия БД - сообщения, пришедшие в последний момент перед рестартом, больше не теряются.
+- Парсер конфига (JSONC): блочный комментарий между значениями теперь работает как разделитель, а не молча склеивает соседние значения.
+- Дедуп входящих учитывает возраст записи: устаревший ключ больше не отбраковывает ложно новое сообщение после того, как перезагрузившееся устройство повторно использовало `seq`.
+- Per-line debug-лог индексируется по очищенному имени файла: два id, сводящиеся к одному имени, больше не пишут в один файл вперемешку.
+
+### Безопасность
+
+- USSD-код проверяется по строгому набору символов (`[0-9*#+]`) и в очереди, и по HTTP - как номер получателя в SMS; пробелы и буквы больше не могут внедрить лишние токены в команду устройства.
+- Лимиты длины недоверенных значений из сети (id, `seq`) и `guid` из URL ограничивают рост памяти.
+
 ## [0.4.0] - 2026-06-12
 
 ### Добавлено
@@ -150,6 +181,37 @@
 ## English
 
 ## [Unreleased]
+
+## [0.5.0] - 2026-06-14
+
+### Added
+
+- Control commands `status` and `reset` - via the MySQL queue (`type='cmd'`, `to_number='status'|'reset'` in `goip_outbox`) and via HTTP (`POST /stats`, `POST /reset`). The reply is identical on both paths: one JSON row in the inbox table (`line='system'`, `from_number='goip-bridge'`) plus the same body to the webhook (`type:"stat"`); HTTP also returns it inline.
+- `status` command: version, uptime, process and system memory (`/proc/meminfo` on Linux), per-line state (alive, signal, `gsm_status`, carrier, number) and queue counts by status.
+- `reset` command: a soft reset without restarting the service - it cancels all `queued` outbox rows (status `cancelled`; the DB user has no DELETE grant, so rows are kept as history, not deleted) and flushes in-RAM caches (inbound dedup, per-line health/`suspect`, send pacing). It does not touch in-flight sends, the pending webhook queue or the line registry.
+- Error-code descriptions: `errorstatus:N` (a modem `+CMS ERROR`) and `dlr_state:N` (a GSM 03.40 TP-Status) now carry a human-readable text - appended to the `error_code` column (`errorstatus:38 — Network out of order`, backward compatible) and delivered as a separate `error_desc`/`state_desc` field in webhook and HTTP responses.
+
+### Changed
+
+- The HTTP server graceful-shutdown timeout now equals `max(send_timeout_sec, ussd_timeout_sec)`: a long synchronous `/ussd` is no longer cut off mid-flight on shutdown.
+- Outbox rows are validated BEFORE a line is claimed (recipient number, non-empty text, text length, USSD code charset): a bad row is failed immediately instead of holding a line for the whole send timeout.
+- Inbound RECEIVE/DELIVER: the line id is capped at 64 chars (matching the DB column) and `seq` at 32; oversized packets are dropped. Untrusted `line`/`from` are logged quoted - protection against log forging.
+
+### Fixed
+
+- Crash on log rotation when the disk is full: the internal log writer no longer nil-dereferences after a failed reopen.
+- `-update`: the backup binary is removed only after a confirmed `systemctl restart` (previously removed before - no rollback if the restart failed).
+- After a hard restart, interrupted control commands (`cmd`) and USSD are no longer re-run (they are marked `failed` for review); only SMS is requeued.
+- The diagnostic command is panic-guarded and drained on shutdown: an error inside it no longer crashes the service.
+- Background DB writes (inbound SMS, delivery-report update, command reply) are drained on shutdown before the DB is closed - messages received in the last moment before a restart are no longer lost.
+- Config parser (JSONC): a block comment between values now acts as a separator instead of silently merging the neighbouring values.
+- Inbound dedup is age-aware: a stale key no longer falsely drops a genuinely new message after a rebooted device reused a `seq`.
+- The per-line debug log is keyed by the sanitized filename: two ids that collapse to one filename no longer interleave into a single file.
+
+### Security
+
+- The USSD code is validated against a strict charset (`[0-9*#+]`) on both the queue and HTTP paths, like the SMS recipient number; spaces and letters can no longer inject extra tokens into the device command.
+- Length caps on untrusted network values (id, `seq`) and the URL `guid` bound memory growth.
 
 ## [0.4.0] - 2026-06-12
 

@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/sha256"
+	"database/sql"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -114,6 +115,44 @@ func TestStripJSONComments(t *testing.T) {
 	}
 }
 
+// TestStripJSONCommentsBlockSeparator guards the fix that a block comment must act as a token
+// separator: "1/*x*/2" must NOT silently merge into "12" (that produced a quietly-wrong config value).
+func TestStripJSONCommentsBlockSeparator(t *testing.T) {
+	var v map[string]any
+	if err := json.Unmarshal(stripJSONComments([]byte(`{"a":1/*x*/2}`)), &v); err == nil {
+		t.Errorf("block comment between digits must not produce valid merged JSON, got a=%v", v["a"])
+	}
+	// A normally-separated value still parses.
+	if err := json.Unmarshal(stripJSONComments([]byte(`{"a":/*x*/2}`)), &v); err != nil || v["a"] != float64(2) {
+		t.Errorf("block comment before a value must keep it: a=%v err=%v", v["a"], err)
+	}
+}
+
+func TestValidateOutboxJob(t *testing.T) {
+	if c, ok := validateOutboxJob("sms", "+996700000001", sql.NullString{String: "hi", Valid: true}); !ok || c != "" {
+		t.Errorf("valid sms: code=%q ok=%v", c, ok)
+	}
+	if c, ok := validateOutboxJob("sms", "bad num", sql.NullString{String: "hi", Valid: true}); ok || c != "bad_number" {
+		t.Errorf("bad number: code=%q ok=%v", c, ok)
+	}
+	big := sql.NullString{String: strings.Repeat("x", maxSMSTextBytes+1), Valid: true}
+	if c, ok := validateOutboxJob("sms", "100", big); ok || c != "text_too_long" {
+		t.Errorf("oversized text: code=%q ok=%v", c, ok)
+	}
+	if c, ok := validateOutboxJob("ussd", "", sql.NullString{}); ok || c != "bad_ussd_code" {
+		t.Errorf("empty ussd: code=%q ok=%v", c, ok)
+	}
+	if c, ok := validateOutboxJob("ussd", "*100#", sql.NullString{}); !ok || c != "" {
+		t.Errorf("valid ussd: code=%q ok=%v", c, ok)
+	}
+	if c, ok := validateOutboxJob("sms", "100", sql.NullString{}); ok || c != "no_text" {
+		t.Errorf("empty sms text: code=%q ok=%v", c, ok)
+	}
+	if c, ok := validateOutboxJob("ussd", "*100 #", sql.NullString{}); ok || c != "bad_ussd_code" {
+		t.Errorf("ussd with space must be rejected: code=%q ok=%v", c, ok)
+	}
+}
+
 // TestLoadConfigNegativeTimings verifies negative timing values fall back to defaults instead of
 // reaching time.NewTicker/NewTimer (a non-positive duration panics the ticker).
 func TestLoadConfigNegativeTimings(t *testing.T) {
@@ -175,6 +214,23 @@ func TestSeenRecentlyEviction(t *testing.T) {
 	s.seenRecently("R:new:1")
 	if _, ok := s.seen["R:old:1"]; ok {
 		t.Error("stale key should have been evicted by the time-based purge")
+	}
+}
+
+// TestSeenRecentlyAgeAware verifies a key older than the window is NOT treated as a duplicate even
+// when the once-a-minute purge hasn't run yet (a rebooted device reusing a seq must not be dropped).
+func TestSeenRecentlyAgeAware(t *testing.T) {
+	s := newServer(&Config{})
+	s.seenPurge = time.Now()                                        // block the purge so the stale key lingers
+	s.seen["R:Go1:5"] = time.Now().Add(-(seenWindow + time.Minute)) // older than the window
+	if s.seenRecently("R:Go1:5") {
+		t.Error("key older than the window must not be a duplicate")
+	}
+	if s.seenRecently("R:Go1:7") {
+		t.Error("first occurrence is not a dup")
+	}
+	if !s.seenRecently("R:Go1:7") {
+		t.Error("repeat within the window is a dup")
 	}
 }
 
@@ -317,6 +373,108 @@ func TestRecordSendLineFailingRecovered(t *testing.T) {
 	s.recordSend("Go1", true)
 	if len(s.whQueue) != 2 || s.whQueue[1].payload["type"] != "line_recovered" {
 		t.Fatalf("success should emit line_recovered, events=%v", s.whQueue)
+	}
+}
+
+func TestDescribeError(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"errorstatus:38", "Network out of order"},
+		{"1 errorstatus:38", "Network out of order"}, // send ref prefixes the code in the raw ERROR line
+		{"errorstatus:30", "Unknown subscriber"},
+		{"errorstatus:500", "Unknown error (often weak signal / no balance)"},
+		{"errorstatus:600", "manufacturer-specific error"}, // >=512 vendor range
+		{"errorstatus:7", ""},                              // valid format, unmapped standard code -> no guess
+		{"dlr_state:0", "delivered (received by SME)"},
+		{"dlr_state:70", "SM validity period expired (permanent)"},
+		{"dlr_state:50", "temporary error (SC still trying)"}, // unmapped -> range class (32..63)
+		{"dlr_state:80", "permanent error (SC gave up)"},      // unmapped -> range class (64..95)
+		{"timeout", ""},
+		{"bad_number", ""},
+		{"", ""},
+	} {
+		if got := describeError(tc.in); got != tc.want {
+			t.Errorf("describeError(%q)=%q want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestAnnotateError(t *testing.T) {
+	dbCode, desc := annotateError("1 errorstatus:38")
+	if dbCode != "1 errorstatus:38 — Network out of order" {
+		t.Errorf("dbCode=%q", dbCode)
+	}
+	if desc != "Network out of order" {
+		t.Errorf("desc=%q", desc)
+	}
+	// Unknown detail is passed through unchanged, with no description.
+	if c, d := annotateError("timeout"); c != "timeout" || d != "" {
+		t.Errorf("annotateError(timeout)=(%q,%q)", c, d)
+	}
+}
+
+func TestFormatUptime(t *testing.T) {
+	for _, tc := range []struct {
+		d    time.Duration
+		want string
+	}{
+		{0, "00:00:00"},
+		{(16*3600 + 46*60 + 12) * time.Second, "16:46:12"},
+		{(25*3600 + 1*60 + 5) * time.Second, "1d 01:01:05"},
+		{-5 * time.Second, "00:00:00"},
+	} {
+		if got := formatUptime(tc.d); got != tc.want {
+			t.Errorf("formatUptime(%v)=%q want %q", tc.d, got, tc.want)
+		}
+	}
+}
+
+// TestResetClearsCaches verifies reset() flushes the in-RAM soft caches (no DB: only the cache part runs).
+func TestResetClearsCaches(t *testing.T) {
+	s := newServer(&Config{LineDeadSec: 120})
+	s.seen["R:Go1:1"] = time.Now()
+	s.lineSends["Go1"] = []sendRec{{ok: false, at: time.Now()}}
+	s.lineFailing["Go1"] = true
+	s.lineNextSend["Go1"] = time.Now().Add(time.Hour)
+	s.queuedAnnounced["g1"] = time.Now()
+
+	res := s.reset()
+	if _, ok := res["cancelled_queued"]; ok {
+		t.Error("no DB configured: cancelled_queued must be absent")
+	}
+	if len(s.seen) != 0 || len(s.lineSends) != 0 || len(s.lineFailing) != 0 ||
+		len(s.lineNextSend) != 0 || len(s.queuedAnnounced) != 0 {
+		t.Errorf("reset left caches populated: seen=%d sends=%d failing=%d pacing=%d announced=%d",
+			len(s.seen), len(s.lineSends), len(s.lineFailing), len(s.lineNextSend), len(s.queuedAnnounced))
+	}
+}
+
+func TestRunCommand(t *testing.T) {
+	s := newServer(&Config{LineDeadSec: 120})
+	s.lines["Go1"] = &Line{ID: "Go1", Alive: true, LastSeen: time.Now(), Signal: 20}
+
+	status, ok := s.runCommand("status", "http", "")
+	if !ok || status["command"] != "status" || status["type"] != "stat" || status["trigger"] != "http" {
+		t.Fatalf("status payload=%v ok=%v", status, ok)
+	}
+	if status["version"] != appVersion {
+		t.Errorf("version=%v want %v", status["version"], appVersion)
+	}
+	lines, _ := status["lines"].(map[string]any)
+	if lines == nil || lines["total"].(int) != 1 || lines["alive"].(int) != 1 {
+		t.Errorf("lines=%v", status["lines"])
+	}
+
+	rst, ok := s.runCommand("reset", "db", "guid-9")
+	if !ok || rst["command"] != "reset" || rst["id"] != "guid-9" {
+		t.Fatalf("reset payload=%v ok=%v", rst, ok)
+	}
+	if _, has := rst["reset"]; !has {
+		t.Error("reset payload missing 'reset' summary")
+	}
+
+	bad, ok := s.runCommand("nope", "http", "")
+	if ok || bad["error"] != "unknown_cmd" {
+		t.Errorf("unknown cmd payload=%v ok=%v", bad, ok)
 	}
 }
 

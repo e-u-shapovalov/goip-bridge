@@ -47,6 +47,12 @@ CREATE TABLE IF NOT EXISTS goip_outbox (
 
 -- type='sms'  : to_number = recipient, text = body, result -> sms_no / status sent->delivered
 -- type='ussd' : to_number = USSD code (e.g. *100#), text = NULL, result -> reply / status done
+-- type='cmd'  : to_number = control command ('status' | 'reset'), text = NULL. The row is just the
+--               trigger: the bridge marks it status='done' and writes the REPLY as one JSON row into
+--               the inbox table (line='system', from_number='goip-bridge', body in text) + the webhook.
+--               'status' = diagnostics (uptime, RAM, lines, queue counts); 'reset' = cancel all 'queued'
+--               rows (no DELETE grant, so they become 'cancelled') + flush in-RAM caches, no restart.
+--               (Same as POST /stats and POST /reset on the HTTP API.)
 -- guid is the public id returned by POST /sms|/ussd and used by GET /status/{guid}, DELETE /message/{guid}.
 --   Multiple NULL guids are allowed (legacy rows); the scheduler assigns a guid when it claims such a row.
 --

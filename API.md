@@ -376,6 +376,82 @@ Example:
 Important: this is memory only. It is cleared on process restart. Use MySQL
 mode for persistent inbound SMS storage.
 
+## POST /stats
+
+Runs the `status` diagnostic command. The reply is returned inline AND emitted to
+both sinks (so it is also "waiting in the inbox", exactly like the DB path): one
+JSON row in the inbox table (`line="system"`, `from_number="goip-bridge"`) and a
+`stat` webhook event (when `webhook_url` is set). The body is identical everywhere.
+
+```sh
+curl -X POST http://127.0.0.1:8080/stats \
+  -H "Authorization: Bearer CHANGE_ME_TO_LONG_RANDOM_TOKEN"
+```
+
+Example reply:
+
+```json
+{
+  "type": "stat",
+  "command": "status",
+  "trigger": "http",
+  "version": "0.4.0",
+  "started_at": "2026-06-12T21:38:29Z",
+  "uptime_sec": 60372,
+  "uptime": "16:46:12",
+  "runtime": { "go": "go1.24.0", "os": "linux", "arch": "amd64", "num_cpu": 4, "goroutines": 18 },
+  "memory": { "alloc": 3211264, "total_alloc": 9123456, "sys": 24117248,
+              "heap_alloc": 3211264, "heap_sys": 15728640, "heap_inuse": 4096000,
+              "stack_inuse": 524288, "num_gc": 12 },
+  "system_memory": { "mem_total_kb": 2030500, "mem_free_kb": 180300, "mem_available_kb": 920100,
+                     "buffers_kb": 40500, "cached_kb": 610200, "swap_total_kb": 1048572, "swap_free_kb": 1048572 },
+  "lines": {
+    "total": 8, "alive": 7,
+    "list": [
+      { "id": "Go1", "alive": true, "signal": 25, "gsm_status": "LOGIN", "carrier": "TestNet", "num": "996700000001", "last_seen_ago_sec": 3 }
+    ]
+  },
+  "db_configured": true,
+  "db_connected": true,
+  "queue": { "queued": 4, "sending": 1, "sent": 120, "delivered": 110, "failed": 6, "cancelled": 2, "inbox_total": 530 }
+}
+```
+
+`system_memory` (from `/proc/meminfo`) is present on Linux only. `queue` is present
+only when MySQL is connected. Equivalent via the queue:
+`INSERT INTO goip_outbox (type, to_number, status) VALUES ('cmd','status','queued');`
+
+## POST /reset
+
+Runs the `reset` soft-reset command — for when you cannot reach root / restart the
+service but a bad batch must be stopped. It cancels every still-`queued` outbox row
+(the DB user has no `DELETE` grant, so rows become `cancelled`, not deleted — history
+is kept and they simply never send) and flushes in-RAM soft caches (inbound dedup,
+per-line health/`suspect` flags, send pacing). It does NOT touch in-flight sends, the
+pending-webhook retry queue, or the line registry. The reply is delivered like `/stats`.
+
+```sh
+curl -X POST http://127.0.0.1:8080/reset \
+  -H "Authorization: Bearer CHANGE_ME_TO_LONG_RANDOM_TOKEN"
+```
+
+The reply is the full `status` snapshot plus a `reset` summary:
+
+```json
+{
+  "type": "stat",
+  "command": "reset",
+  "trigger": "http",
+  "reset": { "cancelled_queued": 42, "caches_reset": ["inbound_dedup", "line_health", "pacing", "queued_announced"] },
+  "version": "0.4.0",
+  "uptime": "16:46:12",
+  "lines": { "total": 8, "alive": 7, "list": [] }
+}
+```
+
+Equivalent via the queue:
+`INSERT INTO goip_outbox (type, to_number, status) VALUES ('cmd','reset','queued');`
+
 ## Webhook
 
 If `webhook_url` is set, the bridge sends JSON events to your service:
@@ -420,12 +496,17 @@ The sender number is taken from the first GoIP field found in this order:
   "line": "Go1",
   "sms_no": "123",
   "state": "0",
+  "state_desc": "delivered (received by SME)",
   "time": "2026-06-11T10:00:00Z"
 }
 ```
 
-In GoIP protocol, `state: "0"` means delivered. Other values are passed through
-and, in MySQL mode, become `failed` with `error_code='dlr_state:<state>'`.
+In GoIP protocol, `state: "0"` means delivered. The `state` is a GSM 03.40
+TP-Status; when the bridge recognizes it, a human-readable `state_desc` is added
+(e.g. `70` → "SM validity period expired (permanent)"). Non-zero states are passed
+through and, in MySQL mode, become `failed` with
+`error_code='dlr_state:<state> — <description>'` (the description is appended only
+when known, so the value still starts with `dlr_state:<state>`).
 
 ### Queue Events
 
@@ -506,7 +587,8 @@ Failure:
   "id": "1781140000000000-abcdef",
   "msg_type": "sms",
   "line": "Go1",
-  "error": "timeout",
+  "error": "1 errorstatus:38",
+  "error_desc": "Network out of order",
   "channel": {
     "line": "Go1",
     "alive": true,
@@ -519,6 +601,13 @@ Failure:
   "time": "2026-06-11T10:00:00Z"
 }
 ```
+
+`error` is the raw device detail; `error_desc` is added only when the bridge
+recognizes the code. `errorstatus:<n>` is a `+CMS ERROR` from the modem (Quectel
+M35): e.g. `38` "Network out of order", `30` "Unknown subscriber", `500` "Unknown
+error" (often weak signal / no balance). Plain details like `timeout`, `bad_number`,
+`no_address` have no `error_desc`. In MySQL mode the same description is appended to
+the row's `error_code` column.
 
 ### Line Monitoring Events
 
@@ -566,6 +655,15 @@ once per streak); `line_recovered` — a send on that line succeeded again:
   "time": "2026-06-11T10:00:00Z"
 }
 ```
+
+### Status / Reset Command Event
+
+`stat` — the reply to a `status` or `reset` command (triggered via `POST /stats` /
+`POST /reset` or an outbox `type='cmd'` row). The exact same JSON is also written as
+one row into the inbox table (`line="system"`, `from_number="goip-bridge"`), so the
+answer can be awaited in the inbox uniformly, regardless of how it was requested. See
+`POST /stats` and `POST /reset` above for the full body; `command` is `"status"` or
+`"reset"`, `trigger` is `"http"` or `"db"`.
 
 ### Webhook Retry
 

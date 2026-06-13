@@ -292,7 +292,7 @@ Visual schemes and first-run maps: [SCHEMES.md](SCHEMES.md)
 For normal users, no Git and no source build are required.
 
 1. Open GitHub Releases: <https://github.com/e-u-shapovalov/goip-bridge/releases>
-2. Open the latest release, currently **v0.4.0**.
+2. Open the latest release, currently **v0.5.0**.
 3. Download the **`goip-bridge`** file from **Assets**.
 4. Do not download `Source code (zip)` or `Source code (tar.gz)` unless you want to build from source.
 5. Do not use `Code -> Download ZIP` if you only need the ready-to-run program.
