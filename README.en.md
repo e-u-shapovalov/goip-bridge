@@ -1,5 +1,7 @@
 # goip-bridge - GoIP SMS/USSD API, webhooks and optional MySQL queue
 
+> Already running? Everyday commands (update, status, send, reset the queue) are in the [**Command Cheatsheet**](#command-cheatsheet).
+
 ## Quick Start
 
 The commands below target Linux x86-64 / amd64. Switch to root with `sudo -i` or prefix system commands with `sudo`.
@@ -408,6 +410,55 @@ failures are returned as JSON with `status: "failed"` and an `error` field. If
 `default_lines` or all alive lines — in both the synchronous and the MySQL
 queue mode.
 
+## Command Cheatsheet
+
+What the bridge can do and how to ask - one line each. Detail: HTTP - [API.md](API.md), database - [MYSQL.md](MYSQL.md), webhook events - [below](#webhook-events).
+
+> Every HTTP request except `/health` needs `Authorization: Bearer <http_token>`. The API listens on `127.0.0.1:8080` by default. Token on the server: `grep -oP '"http_token"\s*:\s*"\K[^"]+' /opt/goip-bridge/config.json`
+
+<details>
+<summary><b>Service control</b> (update, version, health)</summary>
+
+| Task | Command | Notes |
+|---|---|---|
+| Update | `sudo /opt/goip-bridge/goip-bridge -update` | downloads the latest release, verifies SHA256, swaps the binary, restarts (as root) |
+| Version | `/opt/goip-bridge/goip-bridge -version` | prints the running version |
+| Health | `curl http://127.0.0.1:8080/health` | `{ok, lines, alive, db}` - no token |
+
+</details>
+
+<details>
+<summary><b>Via HTTP request</b></summary>
+
+| Task | Request | Notes |
+|---|---|---|
+| Status | `POST /stats` | version, uptime, RAM, lines, queue - reply also in `/inbox` + webhook |
+| Reset | `POST /reset` | cancel all `queued` + flush caches, no restart (cancels the whole queue!) |
+| Send SMS | `POST /sms` `{"line":"Go1","to":"+996700000001","text":"Hello"}` | with MySQL - async (HTTP 202), otherwise result in the response |
+| USSD | `POST /ussd` `{"line":"Go1","code":"*100#"}` | operator reply in the response / `reply` column |
+| Lines | `GET /lines` | all lines: alive, signal, carrier, number |
+| Inbox | `GET /inbox` | last 500, in memory |
+| Message status | `GET /status/<id>` | status, queue position, channel health |
+| Cancel message | `DELETE /message/<id>` | if still `queued` → `cancelled`, else 409 |
+
+Full example: `curl -X POST http://127.0.0.1:8080/stats -H "Authorization: Bearer <http_token>"`
+
+</details>
+
+<details>
+<summary><b>Via the database (MySQL queue)</b></summary>
+
+| Task | SQL | Notes |
+|---|---|---|
+| Status | `INSERT INTO goip_outbox (type,to_number,status) VALUES ('cmd','status','queued');` | reply arrives in `goip_inbox` (`line='system'`) and the webhook |
+| Reset | `INSERT INTO goip_outbox (type,to_number,status) VALUES ('cmd','reset','queued');` | cancel all `queued` + flush caches (cancels the whole queue!) |
+| Send SMS | `INSERT INTO goip_outbox (type,line,to_number,text,status) VALUES ('sms','Go1','+996700000001','Hello','queued');` | empty/NULL `line` = any alive (round-robin) |
+| USSD | `INSERT INTO goip_outbox (type,line,to_number,status) VALUES ('ussd','Go1','*100#','queued');` | reply in the `reply` column when `status='done'` |
+| Inbox | `SELECT id,line,from_number,text,received_at FROM goip_inbox ORDER BY id DESC LIMIT 20;` | persistent storage |
+| Command reply | `SELECT text FROM goip_inbox WHERE line='system' ORDER BY id DESC LIMIT 1;` | JSON reply to status/reset |
+
+</details>
+
 ## HTTP API
 
 Use `Authorization: Bearer <http_token>` when `http_token` is configured.
@@ -449,6 +500,9 @@ The rule is simple: **if `webhook_url` is set - events are always sent**, in eve
 | `done` / `failed` | USSD result - the operator's answer in the `reply` field |
 | `line_down` / `line_up` | a line disappeared / recovered (by keepalive, threshold `line_dead_after_sec`) |
 | `line_failing` / `line_recovered` | `fail_threshold` consecutive send failures / success again |
+| `stat` | reply to a `status`/`reset` command (the same body is written into `goip_inbox`, `line='system'`) |
+
+The `failed`/`dlr` events carry a human-readable description next to the code: `error_desc` (for DLR - `state_desc`), e.g. `errorstatus:38` → `Network out of order`.
 
 USSD has no "inbound" direction: it is always request-response. The request goes via `/ussd` or an `INSERT` with `type='ussd'`, the operator's answer arrives as a `done` event (in MySQL mode also in the `reply` column).
 

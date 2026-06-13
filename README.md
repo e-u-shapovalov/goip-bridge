@@ -1,5 +1,7 @@
 # goip-bridge - SMS/USSD API, webhook и MySQL-очередь для GoIP
 
+> Уже запущено? Готовые команды на каждый день (обновление, статус, отправка, сброс очереди) - в разделе [**Шпаргалка команд**](#шпаргалка-команд).
+
 ## Быстрый старт
 
 Команды ниже рассчитаны на Linux x86-64 / amd64. Перейдите в root через `sudo -i` или добавляйте `sudo` к системным командам.
@@ -473,6 +475,55 @@ curl -H "Authorization: Bearer CHANGE_ME_TO_LONG_RANDOM_TOKEN" http://127.0.0.1:
 
 Если все хорошо, вы увидите JSON со строкой линии и `"alive": true`.
 
+## Шпаргалка команд
+
+Что bridge умеет и как попросить - одной строкой. Подробности: HTTP - [API.md](API.md), база - [MYSQL.md](MYSQL.md), события вебхука - [ниже](#webhook-события).
+
+> Во всех HTTP-запросах, кроме `/health`, нужен заголовок `Authorization: Bearer <http_token>`. API по умолчанию на `127.0.0.1:8080`. Токен на сервере: `grep -oP '"http_token"\s*:\s*"\K[^"]+' /opt/goip-bridge/config.json`
+
+<details>
+<summary><b>Управление сервисом</b> (обновление, версия, здоровье)</summary>
+
+| Задача | Команда | Описание |
+|---|---|---|
+| Обновить версию | `sudo /opt/goip-bridge/goip-bridge -update` | качает последний релиз, сверяет SHA256, подменяет бинарь и перезапускает сервис (от root) |
+| Текущая версия | `/opt/goip-bridge/goip-bridge -version` | печатает версию |
+| Живость | `curl http://127.0.0.1:8080/health` | `{ok, lines, alive, db}` - без токена |
+
+</details>
+
+<details>
+<summary><b>Через HTTP-запрос</b></summary>
+
+| Задача | Запрос | Описание |
+|---|---|---|
+| Состояние | `POST /stats` | версия, аптайм, ОЗУ, линии, очередь - ответ ещё и во `/inbox` + вебхук |
+| Сброс очереди | `POST /reset` | отменить все `queued` + сбросить кеши, без рестарта (отменяет всю очередь!) |
+| Отправить SMS | `POST /sms` `{"line":"Go1","to":"+996700000001","text":"Привет"}` | при MySQL - async (HTTP 202), без базы - результат в ответе |
+| USSD | `POST /ussd` `{"line":"Go1","code":"*100#"}` | ответ оператора в ответе / колонке `reply` |
+| Список линий | `GET /lines` | все линии: alive, сигнал, оператор, номер |
+| Входящие SMS | `GET /inbox` | последние 500 из памяти |
+| Статус сообщения | `GET /status/<id>` | статус, позиция в очереди, здоровье канала |
+| Отменить сообщение | `DELETE /message/<id>` | если ещё `queued` → `cancelled`, иначе 409 |
+
+Пример целиком: `curl -X POST http://127.0.0.1:8080/stats -H "Authorization: Bearer <http_token>"`
+
+</details>
+
+<details>
+<summary><b>Через базу (MySQL-очередь)</b></summary>
+
+| Задача | SQL | Описание |
+|---|---|---|
+| Состояние | `INSERT INTO goip_outbox (type,to_number,status) VALUES ('cmd','status','queued');` | ответ приходит в `goip_inbox` (`line='system'`) и в вебхук |
+| Сброс очереди | `INSERT INTO goip_outbox (type,to_number,status) VALUES ('cmd','reset','queued');` | отменить все `queued` + сбросить кеши (отменяет всю очередь!) |
+| Отправить SMS | `INSERT INTO goip_outbox (type,line,to_number,text,status) VALUES ('sms','Go1','+996700000001','Привет','queued');` | `line` пустой/NULL = любая живая (round-robin) |
+| USSD | `INSERT INTO goip_outbox (type,line,to_number,status) VALUES ('ussd','Go1','*100#','queued');` | ответ в колонке `reply` при `status='done'` |
+| Входящие SMS | `SELECT id,line,from_number,text,received_at FROM goip_inbox ORDER BY id DESC LIMIT 20;` | постоянное хранение |
+| Ответ команды | `SELECT text FROM goip_inbox WHERE line='system' ORDER BY id DESC LIMIT 1;` | JSON-ответ на status/reset |
+
+</details>
+
 ## HTTP API
 
 Если в `config.json` задан `http_token`, добавляйте заголовок:
@@ -532,6 +583,9 @@ curl -H "Authorization: Bearer CHANGE_ME_TO_LONG_RANDOM_TOKEN" http://127.0.0.1:
 | `done` / `failed` | результат USSD - ответ оператора в поле `reply` |
 | `line_down` / `line_up` | линия пропала / восстановилась (по keepalive, порог `line_dead_after_sec`) |
 | `line_failing` / `line_recovered` | `fail_threshold` ошибок отправки подряд / снова успех |
+| `stat` | ответ на команду `status`/`reset` (то же тело пишется в `goip_inbox`, `line='system'`) |
+
+У событий `failed`/`dlr` рядом с кодом приходит человекочитаемое описание: `error_desc` (для DLR - `state_desc`), например `errorstatus:38` → `Network out of order`.
 
 У USSD нет «входящих»: это всегда запрос-ответ. Запрос уходит через `/ussd` или `INSERT` с `type='ussd'`, ответ оператора приходит событием `done` (в MySQL-режиме - ещё и в колонку `reply`).
 
